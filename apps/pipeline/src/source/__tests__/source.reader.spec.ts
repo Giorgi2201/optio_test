@@ -78,8 +78,9 @@ describe('SourceReader - Keyset & Cursor Extraction', () => {
     await reader.fetchIncrementalBatch(timestamp, 8500, 250);
 
     assert.ok(
-      capturedQuery.includes('(updated_at > $1) OR (updated_at = $1 AND id > $2)'),
-      'Query must use composite keyset tie-breaker'
+      capturedQuery.includes("date_trunc('millisecond', updated_at) > date_trunc('millisecond', $1::timestamptz)") &&
+      capturedQuery.includes("date_trunc('millisecond', updated_at) = date_trunc('millisecond', $1::timestamptz) AND id > $2"),
+      'Query must use composite keyset tie-breaker with millisecond truncation'
     );
     assert.ok(capturedQuery.includes('ORDER BY updated_at ASC, id ASC'));
     assert.ok(capturedQuery.includes('LIMIT $3'));

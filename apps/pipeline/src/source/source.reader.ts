@@ -76,7 +76,8 @@ export class SourceReader {
     const queryText = `
       SELECT id, uuid, tenant_id, payload, version, status, is_corrupted, created_at, updated_at
       FROM source_records
-      WHERE (updated_at > $1) OR (updated_at = $1 AND id > $2)
+      WHERE (date_trunc('millisecond', updated_at) > date_trunc('millisecond', $1::timestamptz))
+         OR (date_trunc('millisecond', updated_at) = date_trunc('millisecond', $1::timestamptz) AND id > $2)
       ORDER BY updated_at ASC, id ASC
       LIMIT $3;
     `;
@@ -119,7 +120,8 @@ export class SourceReader {
     const queryText = `
       SELECT COUNT(*) AS lag_count, MAX(updated_at) AS newest_timestamp
       FROM source_records
-      WHERE (updated_at > $1) OR (updated_at = $1 AND id > $2);
+      WHERE (date_trunc('millisecond', updated_at) > date_trunc('millisecond', $1::timestamptz))
+         OR (date_trunc('millisecond', updated_at) = date_trunc('millisecond', $1::timestamptz) AND id > $2);
     `;
 
     const res = await this.db.query<{ lag_count: string | number; newest_timestamp: string | Date | null }>(
