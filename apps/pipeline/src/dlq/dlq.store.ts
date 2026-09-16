@@ -126,6 +126,36 @@ export class DLQStore {
     `;
     await this.db.query(queryText, [status, dlqId]);
   }
+
+  /**
+   * Retrieves a single DLQ entry by ID.
+   */
+  public async getEntryById(dlqId: number): Promise<DLQEntry | null> {
+    const queryText = `
+      SELECT id, record_id, record_uuid, sink_target, payload, error_code,
+             error_message, stack_trace, retry_count, status, created_at, last_retried_at
+      FROM dead_letter_queue
+      WHERE id = $1;
+    `;
+    const res = await this.db.query<RawDLQRow>(queryText, [dlqId]);
+    if (res.rows.length === 0) {
+      return null;
+    }
+    return mapRowToDLQEntry(res.rows[0]);
+  }
+
+  /**
+   * Increments retry_count and updates last_retried_at on failed replay attempt.
+   */
+  public async recordRetryFailure(dlqId: number): Promise<void> {
+    const queryText = `
+      UPDATE dead_letter_queue
+      SET retry_count = retry_count + 1,
+          last_retried_at = NOW()
+      WHERE id = $1;
+    `;
+    await this.db.query(queryText, [dlqId]);
+  }
 }
 
 function mapRowToDLQEntry(row: RawDLQRow): DLQEntry {

@@ -14,6 +14,9 @@ import { RabbitMQSink } from './sinks/rabbitmq/rabbitmq.sink.js';
 import { SourceReader } from './source/source.reader.js';
 import { CheckpointManager } from './checkpoint/checkpoint.manager.js';
 import { DLQStore } from './dlq/dlq.store.js';
+import { DLQReplayer } from './dlq/dlq.replayer.js';
+import { ChaosService } from './simulation/chaos.service.js';
+import { SearchService } from './search/search.service.js';
 import { CircuitBreaker } from './resilience/circuit-breaker.js';
 import { BackfillRunner } from './runners/backfill.runner.js';
 import { IncrementalRunner } from './runners/incremental.runner.js';
@@ -27,6 +30,9 @@ export * from './sinks/rabbitmq/rabbitmq.sink.js';
 export * from './source/source.reader.js';
 export * from './checkpoint/checkpoint.manager.js';
 export * from './dlq/dlq.store.js';
+export * from './dlq/dlq.replayer.js';
+export * from './simulation/chaos.service.js';
+export * from './search/search.service.js';
 export * from './resilience/circuit-breaker.js';
 export * from './runners/backfill.runner.js';
 export * from './runners/incremental.runner.js';
@@ -117,7 +123,17 @@ export async function bootstrap(): Promise<BootstrapResult> {
     pgPool
   );
 
-  const server = createPipelineServer(coordinator, dlqStore);
+  const dlqReplayer = new DLQReplayer(pgPool, dlqStore, esSink, rmqSink);
+  const chaosService = new ChaosService(pgPool, sourceReader, esCircuitBreaker, rmqCircuitBreaker);
+  const searchService = new SearchService(esClient, 'records_search_index');
+
+  const server = createPipelineServer(
+    coordinator,
+    dlqStore,
+    dlqReplayer,
+    chaosService,
+    searchService
+  );
 
   await new Promise<void>((resolve) => {
     server.listen(port, () => {

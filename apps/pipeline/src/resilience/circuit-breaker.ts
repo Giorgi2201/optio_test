@@ -187,4 +187,29 @@ export class CircuitBreaker {
     this.currentBackoffMs = 0;
     this.outageStartTime = null;
   }
+
+  /**
+   * Programmatically trips the circuit breaker to OPEN state (for Gate 3 chaos testing).
+   */
+  public trip(durationMs?: number): void {
+    this.state = 'OPEN';
+    this.totalTrips++;
+    this.consecutiveFailures = Math.max(this.consecutiveFailures, this.failureThreshold);
+    this.lastFailureTime = Date.now();
+    if (this.outageStartTime === null) {
+      this.outageStartTime = Date.now();
+    }
+    const backoff = durationMs ?? this.calculateBackoffMs(this.consecutiveFailures);
+    this.currentBackoffMs = backoff;
+    this.nextAttemptTime = Date.now() + backoff;
+
+    if (durationMs && durationMs > 0) {
+      setTimeout(() => {
+        if (this.state === 'OPEN') {
+          this.state = 'HALF_OPEN';
+          this.consecutiveSuccesses = 0;
+        }
+      }, durationMs);
+    }
+  }
 }
