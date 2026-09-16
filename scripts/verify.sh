@@ -30,5 +30,16 @@ if [ ${GATE2_STATUS} -ne 0 ]; then
   exit ${GATE2_STATUS}
 fi
 
+# Gate 3: Receiver Outage, Anti-Busy-Loop & Self-Healing
+GATE3_STATUS=0
+node "${SCRIPT_DIR}/verify/gate3.js" || GATE3_STATUS=$?
+
+if [ ${GATE3_STATUS} -ne 0 ]; then
+  echo "======================================================================"
+  echo "VERIFICATION FAILED AT GATE 3 (Exit code: ${GATE3_STATUS})"
+  echo "======================================================================"
+  exit ${GATE3_STATUS}
+fi
+
 echo "======================================================================"
-echo "Gate 1 & Gate 2 verification completed successfully."
+echo "Gate 1, Gate 2 & Gate 3 verification completed successfully."

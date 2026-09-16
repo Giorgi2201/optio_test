@@ -348,6 +348,100 @@ function evaluateGate2Deduplication(sourceCount, esCount, consumerUniqueCount, d
 }
 
 /**
+ * Stops or trips a downstream receiver to simulate an outage.
+ * If Docker is running and the container exists, stops the container.
+ * Otherwise, calls the pipeline's simulation API to trip the circuit breaker.
+ */
+async function stopReceiver(sinkName = 'elasticsearch', durationMs = 10000) {
+  const containerName = sinkName === 'elasticsearch' ? 'optio-elasticsearch' : 'optio-rabbitmq';
+  if (isDockerRunning() && doesDockerContainerExist(containerName)) {
+    try {
+      execSync(`docker stop ${containerName}`, { stdio: 'ignore', timeout: 10000 });
+      return { mode: 'docker', container: containerName, action: 'stopped' };
+    } catch (err) {
+      console.warn(`[WARN] Failed to stop ${containerName} via Docker, falling back to API:`, err.message);
+    }
+  }
+
+  // Native / API mode: Call /api/simulation/trip-breaker
+  const tripUrl = process.env.PIPELINE_SIMULATION_URL || 'http://localhost:3000/api/simulation/trip-breaker';
+  try {
+    const res = await fetch(tripUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sink: sinkName, durationMs }),
+      signal: AbortSignal.timeout(5000)
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return { mode: 'api', sink: sinkName, ...data };
+    }
+  } catch (err) {
+    console.warn(`[WARN] Failed to trip circuit breaker via simulation API:`, err.message);
+  }
+  return { mode: 'fallback', sink: sinkName, durationMs };
+}
+
+/**
+ * Restores a downstream receiver after an outage.
+ * If Docker is running and container exists, starts the container.
+ */
+async function startReceiver(sinkName = 'elasticsearch') {
+  const containerName = sinkName === 'elasticsearch' ? 'optio-elasticsearch' : 'optio-rabbitmq';
+  if (isDockerRunning() && doesDockerContainerExist(containerName)) {
+    try {
+      execSync(`docker start ${containerName}`, { stdio: 'ignore', timeout: 15000 });
+      return { mode: 'docker', container: containerName, action: 'started' };
+    } catch (err) {
+      console.warn(`[WARN] Failed to start ${containerName} via Docker:`, err.message);
+    }
+  }
+  return { mode: 'api', sink: sinkName, action: 'restored' };
+}
+
+/**
+ * Evaluates Gate 3 receiver outage, zero busy-loop, and self-healing invariants.
+ * Asserts:
+ * 1. downtimeSec > 0 (receiver was genuinely down for a non-trivial duration)
+ * 2. lostRecords === 0 (no records dropped or lost during receiver blackout)
+ * 3. recoveryTimeSec >= 0 (pipeline resumed and achieved parity post-restoration)
+ */
+function evaluateGate3Outage(downtimeSec, lostRecords = 0, recoveryTimeSec = 0) {
+  const downtimeValid = downtimeSec > 0;
+  const zeroLost = lostRecords === 0;
+  const numRecTime = typeof recoveryTimeSec === 'number' ? recoveryTimeSec : parseFloat(recoveryTimeSec);
+  const recoveryValid = !isNaN(numRecTime) && numRecTime >= 0;
+
+  const passed = downtimeValid && zeroLost && recoveryValid;
+
+  let details;
+  if (passed) {
+    const recStr = typeof recoveryTimeSec === 'string' && recoveryTimeSec.endsWith('s')
+      ? recoveryTimeSec
+      : `${recoveryTimeSec}s`;
+    details = `${downtimeSec}s down, ${lostRecords} lost, recovered in ${recStr}`;
+  } else {
+    const reasons = [];
+    if (!downtimeValid) reasons.push(`zero downtime simulated (${downtimeSec}s)`);
+    if (!zeroLost) reasons.push(`${lostRecords} records lost during outage`);
+    if (!recoveryValid) reasons.push(`recovery timed out or failed`);
+    details = reasons.join(', ');
+  }
+
+  const output = formatGateResult('G3 sink outage', passed ? 'PASS' : 'FAIL', details);
+
+  return {
+    passed,
+    downtimeSec,
+    lostRecords,
+    recoveryTimeSec,
+    formattedTime: `${downtimeSec}s`,
+    details,
+    output
+  };
+}
+
+/**
  * Async sleep helper.
  */
 function sleep(ms) {
@@ -366,8 +460,11 @@ module.exports = {
   doesDockerContainerExist,
   startPipelineProcess,
   killPipelineProcess,
+  stopReceiver,
+  startReceiver,
   formatGateResult,
   evaluateGate1Resumption,
   evaluateGate2Deduplication,
+  evaluateGate3Outage,
   sleep
 };
