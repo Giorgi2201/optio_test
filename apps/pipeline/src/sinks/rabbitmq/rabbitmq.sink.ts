@@ -111,6 +111,13 @@ export class RabbitMQSink {
   }
 
   /**
+   * Alias for disconnect() for standard resource teardown.
+   */
+  public async close(): Promise<void> {
+    return this.disconnect();
+  }
+
+  /**
    * Healthcheck probe for Gate 5 and Circuit Breakers.
    */
   public async healthCheck(): Promise<RabbitMQHealthResult> {

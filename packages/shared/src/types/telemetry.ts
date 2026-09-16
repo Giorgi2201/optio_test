@@ -17,6 +17,17 @@ export interface SystemHealth {
   rabbitmq: ComponentHealth;
 }
 
+export interface CircuitBreakerTelemetry {
+  name?: string;
+  state: CircuitBreakerState;
+  consecutiveFailures?: number;
+  consecutiveSuccesses?: number;
+  totalTrips?: number;
+  currentBackoffMs?: number;
+  totalDowntimeMs?: number;
+  isThrottling?: boolean;
+}
+
 export interface PipelineTelemetry {
   backfill_cursor: number;
   backfill_total_records: number;
@@ -26,5 +37,9 @@ export interface PipelineTelemetry {
   incremental_lag_ms: number;
   dlq_pending_count: number;
   health: SystemHealth;
+  circuit_breakers?: {
+    elasticsearch: CircuitBreakerTelemetry;
+    rabbitmq: CircuitBreakerTelemetry;
+  };
   timestamp: string;
 }

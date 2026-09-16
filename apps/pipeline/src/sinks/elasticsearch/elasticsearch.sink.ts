@@ -209,4 +209,16 @@ export class ElasticsearchSink {
       failures
     };
   }
+
+  public getClient(): Client {
+    return this.client;
+  }
+
+  public getIndexName(): string {
+    return this.indexName;
+  }
+
+  public async close(): Promise<void> {
+    await this.client.close();
+  }
 }
