@@ -6,6 +6,9 @@
   "main": "scripts/migrate.js",
   "scripts": {
     "migrate": "node scripts/migrate.js",
+    "seed": "node scripts/seed.js",
+    "seed:dry": "node scripts/seed.js --dry-run",
+    "seed:fresh": "node scripts/seed.js --fresh",
     "probe": "node scripts/env-probe.js"
   },
   "dependencies": {
