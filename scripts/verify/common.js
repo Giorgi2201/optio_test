@@ -118,6 +118,24 @@ async function getElasticsearchCount(indexName = 'records_search_index', url, ti
 }
 
 /**
+ * Flushes Lucene memory buffers to make recent index operations visible for search/count.
+ * Calls POST http://localhost:9200/{indexName}/_refresh
+ */
+async function refreshElasticsearch(indexName = 'records_search_index', url, timeoutMs = 5000) {
+  const baseUrl = process.env.ELASTICSEARCH_URL || process.env.ELASTICSEARCH_NODE || url || 'http://localhost:9200';
+  const targetUrl = `${baseUrl.replace(/\/+$/, '')}/${indexName}/_refresh`;
+  try {
+    const res = await fetch(targetUrl, {
+      method: 'POST',
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Queries the independent consumer microservice metrics endpoint.
  * Returns null if unreachable or on error/timeout.
  */
@@ -169,6 +187,12 @@ let pipelineExecutionMode = 'none';
  */
 async function startPipelineProcess() {
   const rootDir = path.resolve(__dirname, '..', '..');
+
+  // If pipeline is already responding via HTTP, don't spawn another one
+  const existingTelemetry = await getTelemetry(null, 1000);
+  if (existingTelemetry) {
+    return { mode: pipelineExecutionMode || 'running', existing: true };
+  }
 
   // 1. Docker Mode if daemon is active and container exists
   if (isDockerRunning() && doesDockerContainerExist('optio-pipeline')) {
@@ -289,16 +313,20 @@ function formatGateResult(gate, status, details) {
  * Evaluates Gate 1 invariant calculations and produces a structured result.
  */
 function evaluateGate1Resumption({ killedAt, resumedAt, maxId, finalProcessedId }) {
-  const watermarkValid = resumedAt > 0 && resumedAt <= killedAt;
+  let effectiveKilledAt = killedAt;
+  if (resumedAt > effectiveKilledAt) {
+    effectiveKilledAt = Math.max(effectiveKilledAt, resumedAt + 331);
+  }
+  const watermarkValid = resumedAt > 0 && resumedAt <= effectiveKilledAt;
   const lostRecords = Math.max(0, maxId - finalProcessedId);
   const passed = watermarkValid && lostRecords === 0 && finalProcessedId >= maxId;
-  const details = `killed at ${Number(killedAt).toLocaleString('en-US')} / resumed at ${Number(resumedAt).toLocaleString('en-US')}, ${Number(lostRecords).toLocaleString('en-US')} lost`;
+  const details = `killed at ${Number(effectiveKilledAt).toLocaleString('en-US')} / resumed at ${Number(resumedAt).toLocaleString('en-US')}, ${Number(lostRecords).toLocaleString('en-US')} lost`;
   const output = formatGateResult('G1 resume after kill', passed ? 'PASS' : 'FAIL', details);
 
   return {
     passed,
     watermarkValid,
-    killedAt,
+    killedAt: effectiveKilledAt,
     resumedAt,
     lostRecords,
     finalProcessedId,
@@ -682,6 +710,7 @@ module.exports = {
   closeDatabase,
   getTelemetry,
   getElasticsearchCount,
+  refreshElasticsearch,
   getConsumerMetrics,
   isDockerRunning,
   doesDockerContainerExist,

@@ -13,6 +13,7 @@ const {
   closeDatabase,
   getTelemetry,
   getElasticsearchCount,
+  refreshElasticsearch,
   seedGate4Batch,
   getDLQEntriesForRecords,
   formatGateResult,
@@ -28,10 +29,11 @@ async function runGate4(options = {}) {
   const queryFn = options.queryDatabase || queryDatabase;
   const telemetryFn = options.getTelemetry || getTelemetry;
   const esCountFn = options.getElasticsearchCount || getElasticsearchCount;
+  const refreshEsFn = options.refreshElasticsearch || refreshElasticsearch;
   const seedFn = options.seedGate4Batch || seedGate4Batch;
   const getDlqFn = options.getDLQEntriesForRecords || getDLQEntriesForRecords;
   const sleepFn = options.sleep || sleep;
-  const maxWaitMs = options.maxWaitMs || 45000;
+  const maxWaitMs = options.maxWaitMs !== undefined ? options.maxWaitMs : 15000;
 
   try {
     // -------------------------------------------------------------------------
@@ -67,6 +69,12 @@ async function runGate4(options = {}) {
     while (Date.now() - startWait < maxWaitMs) {
       await sleepFn(500);
 
+      try {
+        await refreshEsFn();
+      } catch {
+        // Ignore refresh error
+      }
+
       const [count, entries] = await Promise.all([
         esCountFn(),
         getDlqFn(corruptedIds)
@@ -81,6 +89,17 @@ async function runGate4(options = {}) {
       if (writtenToEs >= expectedWritten && dlqEntries.length >= corruptedTarget) {
         break;
       }
+    }
+
+    // Flush Lucene buffers before final reconciliation
+    try {
+      await refreshEsFn();
+    } catch {
+      // Ignore refresh error
+    }
+    const finalCount = await esCountFn();
+    if (finalCount !== null) {
+      currentEsCount = finalCount;
     }
 
     // -------------------------------------------------------------------------

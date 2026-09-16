@@ -12,6 +12,7 @@ const {
   queryDatabase,
   closeDatabase,
   getElasticsearchCount,
+  refreshElasticsearch,
   getConsumerMetrics,
   getTelemetry,
   formatGateResult,
@@ -26,9 +27,10 @@ const {
 async function runGate2(options = {}) {
   const queryFn = options.queryDatabase || queryDatabase;
   const esCountFn = options.getElasticsearchCount || getElasticsearchCount;
+  const refreshEsFn = options.refreshElasticsearch || refreshElasticsearch;
   const consumerMetricsFn = options.getConsumerMetrics || getConsumerMetrics;
   const sleepFn = options.sleep || sleep;
-  const maxWaitMs = options.maxWaitMs || 30000;
+  const maxWaitMs = options.maxWaitMs !== undefined ? options.maxWaitMs : 20000;
 
   try {
     // -------------------------------------------------------------------------
@@ -49,6 +51,11 @@ async function runGate2(options = {}) {
     let consumerMetrics = null;
 
     while (Date.now() - startWait < maxWaitMs) {
+      try {
+        await refreshEsFn();
+      } catch {
+        // Ignore refresh error
+      }
       currentEsCount = await esCountFn();
       consumerMetrics = await consumerMetricsFn();
 
@@ -61,6 +68,21 @@ async function runGate2(options = {}) {
         break;
       }
       await sleepFn(500);
+    }
+
+    // Flush Lucene buffers before asserting final counts
+    try {
+      await refreshEsFn();
+    } catch {
+      // Ignore refresh error
+    }
+    const finalEsCount = await esCountFn();
+    if (finalEsCount !== null) {
+      currentEsCount = finalEsCount;
+    }
+    const finalConsumerMetrics = await consumerMetricsFn();
+    if (finalConsumerMetrics !== null) {
+      consumerMetrics = finalConsumerMetrics;
     }
 
     if (currentEsCount === null) {

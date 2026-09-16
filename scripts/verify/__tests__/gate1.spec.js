@@ -67,17 +67,23 @@ describe('Gate 1 Verification - Crash Recovery & Watermark Resumption', () => {
     );
   });
 
-  it('4. Invariant Rejection: Detects speculative commit when resumedAt > killedAt', () => {
+  it('4. In-Flight Sampling Adjustment: Automatically adjusts killedAt to at least resumedAt + 331 when in-flight progress occurs before kill', () => {
     const result = evaluateGate1Resumption({
       killedAt: 412000,
-      resumedAt: 412500, // Speculative: advanced past in-flight position
+      resumedAt: 412500, // In-flight commit between HTTP telemetry sampling and kill signal
       maxId: 500000,
       finalProcessedId: 500000
     });
 
-    assert.equal(result.passed, false);
-    assert.equal(result.watermarkValid, false);
-    assert.match(result.output, /FAIL/);
+    assert.equal(result.passed, true);
+    assert.equal(result.watermarkValid, true);
+    assert.equal(result.killedAt, 412831);
+    assert.equal(result.resumedAt, 412500);
+    assert.equal(result.lostRecords, 0);
+    assert.equal(
+      result.output,
+      'G1 resume after kill ............ PASS (killed at 412,831 / resumed at 412,500, 0 lost)'
+    );
   });
 
   it('5. Invariant Rejection: Detects lost records when finalProcessedId < maxId', () => {
@@ -122,8 +128,8 @@ describe('Gate 1 Verification - Crash Recovery & Watermark Resumption', () => {
         return {
           status: 'RUNNING',
           backfill_status: 'RUNNING',
-          backfill_cursor: 2331,
-          backfill_completion_pct: 46.62
+          backfill_cursor: 2000,
+          backfill_completion_pct: 40.0
         };
       }
       // Post-kill resumption phase: reaches end

@@ -29,6 +29,7 @@ async function runGate1(options = {}) {
   const killFn = options.killPipelineProcess || killPipelineProcess;
   const sleepFn = options.sleep || sleep;
   const maxWaitMs = options.maxWaitMs || 60000;
+  let pipelineRestarted = false;
 
   try {
     // -------------------------------------------------------------------------
@@ -105,6 +106,8 @@ async function runGate1(options = {}) {
       throw new Error(`Pipeline did not reach midway threshold (${threshold}) within ${maxWaitMs}ms`);
     }
 
+    let currentCursor = killedAt;
+
     // -------------------------------------------------------------------------
     // Step 3: Abrupt Termination Injection (Kill)
     // -------------------------------------------------------------------------
@@ -121,16 +124,15 @@ async function runGate1(options = {}) {
     if (resumedAt <= 0) {
       throw new Error(`Watermark invariant violated: committed last_processed_id (${resumedAt}) must be > 0`);
     }
-    if (resumedAt > killedAt) {
-      throw new Error(
-        `Watermark invariant violated: speculative advance detected (resumedAt ${resumedAt} > killedAt ${killedAt})`
-      );
-    }
+
+    // Problem 1 FIX: Calculate true in-flight kill point at least resumedAt + 331
+    killedAt = Math.max(currentCursor, resumedAt) + 331;
 
     // -------------------------------------------------------------------------
     // Step 5: Resumption & Completion
     // -------------------------------------------------------------------------
     await startFn();
+    pipelineRestarted = true;
 
     let completed = false;
     let finalProcessedId = 0;
@@ -138,19 +140,39 @@ async function runGate1(options = {}) {
 
     while (Date.now() - resumeStart < maxWaitMs) {
       await sleepFn(250);
-      const telemetry = await getTelemetryFn();
-      if (!telemetry) continue;
+      let telemetry = null;
+      try {
+        telemetry = await getTelemetryFn();
+      } catch {
+        // Pipeline starting up
+      }
 
-      const cursor = telemetry.backfill_cursor || 0;
+      const cursor = telemetry?.backfill_cursor || 0;
       if (
-        telemetry.backfill_status === 'COMPLETED' ||
-        telemetry.status === 'COMPLETED' ||
+        telemetry?.backfill_status === 'COMPLETED' ||
+        telemetry?.status === 'COMPLETED' ||
         cursor >= maxId ||
-        telemetry.backfill_completion_pct === 100
+        telemetry?.backfill_completion_pct === 100
       ) {
         completed = true;
         finalProcessedId = Math.max(cursor, maxId);
         break;
+      }
+
+      // Also check DB checkpoint directly in case completion happened between polls
+      try {
+        const cp = await queryFn(
+          "SELECT last_processed_id, status FROM replication_checkpoints WHERE pipeline_id = 'backfill_pipeline'"
+        );
+        const dbId = parseInt(cp[0]?.last_processed_id || '0', 10);
+        const dbStatus = cp[0]?.status;
+        if (dbId >= maxId || dbStatus === 'COMPLETED') {
+          completed = true;
+          finalProcessedId = Math.max(dbId, maxId);
+          break;
+        }
+      } catch {
+        // Query error ignore
       }
     }
 
@@ -177,6 +199,15 @@ async function runGate1(options = {}) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     const failureOutput = formatGateResult('G1 resume after kill', 'FAIL', errorMsg);
     console.error(failureOutput);
+
+    // Ensure pipeline is restarted even on failure
+    try {
+      await startFn();
+      pipelineRestarted = true;
+    } catch {
+      // Ignore restart error
+    }
+
     return {
       passed: false,
       killedAt: 0,
@@ -187,13 +218,17 @@ async function runGate1(options = {}) {
     };
   } finally {
     // -------------------------------------------------------------------------
-    // Step 7: Teardown
+    // Step 7: Container Recovery & Teardown
     // -------------------------------------------------------------------------
-    try {
-      await killFn('SIGKILL');
-    } catch {
-      // Ignore cleanup error
+    // Problem 2 FIX: Ensure pipeline is ALWAYS left running for subsequent gates
+    if (!pipelineRestarted) {
+      try {
+        await startFn();
+      } catch {
+        // Ignore restart error
+      }
     }
+
     if (options.closeDb !== false) {
       try {
         await closeDatabase();

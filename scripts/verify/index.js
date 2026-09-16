@@ -12,7 +12,7 @@
  * Emits the standardized 5-gate resilience verification report.
  */
 
-const { closeDatabase, formatGateResult } = require('./common.js');
+const { closeDatabase, formatGateResult, startPipelineProcess } = require('./common.js');
 const { runGate1 } = require('./gate1.js');
 const { runGate2 } = require('./gate2.js');
 const { runGate3 } = require('./gate3.js');
@@ -115,8 +115,20 @@ async function runVerification(options = {}) {
   const results = [];
   let allPassed = true;
 
+  const startProcessFn = options.startPipelineProcess !== undefined
+    ? options.startPipelineProcess
+    : (options.runners ? null : startPipelineProcess);
+
   try {
     for (const g of targetGates) {
+      if (startProcessFn) {
+        try {
+          await startProcessFn();
+        } catch {
+          // Ignore daemon start error if already running or handled by gate
+        }
+      }
+
       const gateOpts = {
         closeDb: false,
         silent: options.silent,
