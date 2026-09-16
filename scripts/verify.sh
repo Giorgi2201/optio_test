@@ -41,5 +41,16 @@ if [ ${GATE3_STATUS} -ne 0 ]; then
   exit ${GATE3_STATUS}
 fi
 
+# Gate 4: Partial Batch Failure & DLQ Isolation
+GATE4_STATUS=0
+node "${SCRIPT_DIR}/verify/gate4.js" || GATE4_STATUS=$?
+
+if [ ${GATE4_STATUS} -ne 0 ]; then
+  echo "======================================================================"
+  echo "VERIFICATION FAILED AT GATE 4 (Exit code: ${GATE4_STATUS})"
+  echo "======================================================================"
+  exit ${GATE4_STATUS}
+fi
+
 echo "======================================================================"
-echo "Gate 1, Gate 2 & Gate 3 verification completed successfully."
+echo "Gates 1 through 4 verification completed successfully."

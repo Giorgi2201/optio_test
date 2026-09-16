@@ -442,6 +442,143 @@ function evaluateGate3Outage(downtimeSec, lostRecords = 0, recoveryTimeSec = 0) 
 }
 
 /**
+ * Seeds a deterministic batch of records for Gate 4 testing into source_records.
+ * Exactly (total - corruptedCount) are valid payloads, and exactly corruptedCount are poison pills.
+ */
+async function seedGate4Batch(total = 500, corruptedCount = 3) {
+  const validCount = Math.max(0, total - corruptedCount);
+  const insertedIds = [];
+  const corruptedIds = [];
+
+  if (validCount > 0) {
+    const validRows = await queryDatabase(`
+      INSERT INTO source_records (uuid, tenant_id, payload, version, status, is_corrupted, created_at, updated_at)
+      SELECT
+        gen_random_uuid(),
+        'tenant_gate4_valid',
+        jsonb_build_object(
+          'customer_id', 'cust_g4_' || i,
+          'full_name', 'Valid User ' || i,
+          'email', 'valid_user_' || i || '@example.com',
+          'account_tier', CASE WHEN i % 2 = 0 THEN 'GOLD' ELSE 'STANDARD' END,
+          'balance', (100.0 + (i * 5.25))::numeric,
+          'tags', jsonb_build_array('gate4', 'valid')
+        ),
+        1,
+        'ACTIVE',
+        FALSE,
+        NOW(),
+        NOW()
+      FROM generate_series(1, $1) AS i
+      RETURNING id;
+    `, [validCount]);
+
+    for (const r of validRows) {
+      insertedIds.push(parseInt(r.id, 10));
+    }
+  }
+
+  for (let c = 1; c <= corruptedCount; c++) {
+    const corruptedRows = await queryDatabase(`
+      INSERT INTO source_records (uuid, tenant_id, payload, version, status, is_corrupted, created_at, updated_at)
+      VALUES (
+        gen_random_uuid(),
+        'tenant_gate4_poison',
+        jsonb_build_object(
+          'customer_id', 'poison_pill_' || $1,
+          'full_name', 'Corrupted Record ' || $1,
+          'email', 'CORRUPTED_EMAIL_FORMAT_INVALID',
+          'account_tier', 'ILLEGAL_TIER_ENUM_VALUE',
+          'balance', 'NOT_A_VALID_DECIMAL_NUMBER',
+          'is_poison_pill', true,
+          'illegal_field_injection', jsonb_build_object('deep', 'broken')
+        ),
+        1,
+        'ACTIVE',
+        TRUE,
+        NOW(),
+        NOW()
+      )
+      RETURNING id;
+    `, [c]);
+
+    const cId = parseInt(corruptedRows[0].id, 10);
+    insertedIds.push(cId);
+    corruptedIds.push(cId);
+  }
+
+  insertedIds.sort((a, b) => a - b);
+  corruptedIds.sort((a, b) => a - b);
+
+  return {
+    insertedIds,
+    corruptedIds
+  };
+}
+
+/**
+ * Queries dead_letter_queue for entries matching specific record IDs.
+ */
+async function getDLQEntriesForRecords(recordIds = []) {
+  if (!recordIds || recordIds.length === 0) {
+    return [];
+  }
+  const rows = await queryDatabase(
+    'SELECT id, record_id, record_uuid, sink_target, payload, error_code, error_message, stack_trace, retry_count, status, created_at, last_retried_at FROM dead_letter_queue WHERE record_id = ANY($1) ORDER BY id ASC',
+    [recordIds]
+  );
+  return rows;
+}
+
+/**
+ * Evaluates Gate 4 partial batch failure and DLQ quarantine invariants.
+ * Asserts:
+ * 1. writtenCount === 497 (valid records committed to sink)
+ * 2. dlqCount === 3 (poison pills quarantined in DLQ)
+ * 3. !batchRolledBack (entire batch was NOT aborted or rolled back)
+ * 4. contextSufficient === true (DLQ rows preserve original payload, error codes, and stack traces allowing retry)
+ */
+function evaluateGate4PartialFailure(writtenCount, dlqCount, batchRolledBack = false, contextSufficient = true) {
+  const notRolledBack = !batchRolledBack && writtenCount > 0;
+  const writtenValid = writtenCount === 497;
+  const dlqValid = dlqCount === 3;
+  const contextValid = contextSufficient === true;
+
+  const passed = notRolledBack && writtenValid && dlqValid && contextValid;
+
+  let details;
+  if (passed) {
+    details = `${writtenCount} written, ${dlqCount} in DLQ`;
+  } else {
+    const reasons = [];
+    if (batchRolledBack || writtenCount === 0) {
+      reasons.push(`batch was rolled back (${writtenCount} written)`);
+    } else if (!writtenValid) {
+      reasons.push(`${writtenCount} written (expected 497)`);
+    }
+    if (!dlqValid) {
+      reasons.push(`${dlqCount} in DLQ (expected 3)`);
+    }
+    if (!contextValid) {
+      reasons.push('insufficient DLQ retry context');
+    }
+    details = reasons.join(', ');
+  }
+
+  const output = formatGateResult('G4 partial batch failure', passed ? 'PASS' : 'FAIL', details);
+
+  return {
+    passed,
+    writtenCount,
+    dlqCount,
+    batchRolledBack,
+    contextSufficient,
+    details,
+    output
+  };
+}
+
+/**
  * Async sleep helper.
  */
 function sleep(ms) {
@@ -462,9 +599,12 @@ module.exports = {
   killPipelineProcess,
   stopReceiver,
   startReceiver,
+  seedGate4Batch,
+  getDLQEntriesForRecords,
   formatGateResult,
   evaluateGate1Resumption,
   evaluateGate2Deduplication,
   evaluateGate3Outage,
+  evaluateGate4PartialFailure,
   sleep
 };
