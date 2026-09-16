@@ -1,0 +1,23 @@
+{
+  "name": "optio",
+  "version": "1.0.0",
+  "description": "Fault-tolerant dual-sink data replication platform",
+  "private": true,
+  "main": "scripts/migrate.js",
+  "scripts": {
+    "migrate": "node scripts/migrate.js",
+    "probe": "node scripts/env-probe.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "pg": "^8.11.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.7",
+    "@types/pg": "^8.11.5",
+    "typescript": "^5.4.5"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
