@@ -1,0 +1,75 @@
+networks:
+  optio-network:
+    name: optio-network
+    driver: bridge
+
+volumes:
+  postgres_data:
+    name: optio_postgres_data
+  elasticsearch_data:
+    name: optio_elasticsearch_data
+  rabbitmq_data:
+    name: optio_rabbitmq_data
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: optio-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-optio}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-optio_secure_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-optio_replication}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-optio} -d ${POSTGRES_DB:-optio_replication}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - optio-network
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    container_name: optio-elasticsearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -vq 'red'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - optio-network
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: optio-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-optio}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-optio_secure_pass}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics check_running"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - optio-network
