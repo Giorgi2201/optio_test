@@ -99,6 +99,42 @@ async function getTelemetry(url, timeoutMs = 3000) {
 }
 
 /**
+ * Queries Elasticsearch cluster for total document count in an index.
+ * Returns null if unreachable or on error/timeout.
+ */
+async function getElasticsearchCount(indexName = 'records_search_index', url, timeoutMs = 3000) {
+  const baseUrl = process.env.ELASTICSEARCH_URL || process.env.ELASTICSEARCH_NODE || url || 'http://localhost:9200';
+  const targetUrl = `${baseUrl.replace(/\/+$/, '')}/${indexName}/_count`;
+  try {
+    const res = await fetch(targetUrl, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) {
+      return null;
+    }
+    const data = await res.json();
+    return typeof data.count === 'number' ? data.count : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Queries the independent consumer microservice metrics endpoint.
+ * Returns null if unreachable or on error/timeout.
+ */
+async function getConsumerMetrics(url, timeoutMs = 3000) {
+  const targetUrl = url || process.env.CONSUMER_METRICS_URL || 'http://localhost:3001/metrics';
+  try {
+    const res = await fetch(targetUrl, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) {
+      return null;
+    }
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Checks if the Docker daemon is accessible and responding.
  */
 function isDockerRunning() {
@@ -271,6 +307,47 @@ function evaluateGate1Resumption({ killedAt, resumedAt, maxId, finalProcessedId 
 }
 
 /**
+ * Evaluates Gate 2 deduplication and delivery guarantee invariants.
+ * Asserts:
+ * 1. sourceCount > 0
+ * 2. sourceCount === esCount (Elasticsearch 1:1 document parity)
+ * 3. sourceCount === consumerUniqueCount (Consumer unique processing parity)
+ * 4. duplicateCount === 0 (Zero duplicate records present in sinks)
+ */
+function evaluateGate2Deduplication(sourceCount, esCount, consumerUniqueCount, duplicateCount = 0) {
+  const sourceValid = sourceCount > 0;
+  const esParity = sourceCount === esCount;
+  const consumerParity = sourceCount === consumerUniqueCount;
+  const zeroDuplicates = duplicateCount === 0;
+
+  const passed = sourceValid && esParity && consumerParity && zeroDuplicates;
+
+  let details;
+  if (passed) {
+    details = `${Number(sourceCount).toLocaleString('en-US')} source / ${Number(esCount).toLocaleString('en-US')} sink / ${Number(duplicateCount).toLocaleString('en-US')} dupes`;
+  } else {
+    const reasons = [];
+    if (!sourceValid) reasons.push(`invalid source count (${sourceCount})`);
+    if (!esParity) reasons.push(`Elasticsearch parity failure (${sourceCount} vs ${esCount})`);
+    if (!consumerParity) reasons.push(`Consumer parity failure (${sourceCount} vs ${consumerUniqueCount})`);
+    if (!zeroDuplicates) reasons.push(`${duplicateCount} duplicates detected in sink`);
+    details = reasons.join(', ');
+  }
+
+  const output = formatGateResult('G2 no duplicates', passed ? 'PASS' : 'FAIL', details);
+
+  return {
+    passed,
+    sourceCount,
+    sinkCount: esCount,
+    consumerUniqueCount,
+    duplicates: duplicateCount,
+    details,
+    output
+  };
+}
+
+/**
  * Async sleep helper.
  */
 function sleep(ms) {
@@ -283,11 +360,14 @@ module.exports = {
   queryDatabase,
   closeDatabase,
   getTelemetry,
+  getElasticsearchCount,
+  getConsumerMetrics,
   isDockerRunning,
   doesDockerContainerExist,
   startPipelineProcess,
   killPipelineProcess,
   formatGateResult,
   evaluateGate1Resumption,
+  evaluateGate2Deduplication,
   sleep
 };
