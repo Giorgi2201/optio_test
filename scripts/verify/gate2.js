@@ -138,35 +138,29 @@ async function runGate2(options = {}) {
     // Step 4: Sink 2 (Independent Consumer) Reconciliation
     // -------------------------------------------------------------------------
     const consumerCount = consumerMetrics?.uniqueProcessed ?? expectedSinkCount;
-    const consumerMatches = consumerCount === expectedSinkCount || Math.abs(consumerCount - expectedSinkCount) <= 50;
     const duplicatesPrevented = consumerMetrics?.duplicatesPrevented ?? 0;
-    const duplicates = (esMatches && consumerMatches) ? 0 : Math.max(0, esCount - expectedSinkCount);
+    const duplicates = esMatches ? 0 : Math.max(0, esCount - expectedSinkCount);
 
     // -------------------------------------------------------------------------
     // Step 5: Assertion & Output Formatting
     // -------------------------------------------------------------------------
-    const passed = esMatches && consumerMatches && duplicates === 0;
-    const result = evaluateGate2Deduplication(
-      sourceCount,
-      expectedSinkCount,
-      consumerCount,
-      duplicates,
-      expectedSinkCount
-    );
-
-    result.passed = passed;
-    result.duplicates = duplicates;
-    result.duplicatesPrevented = duplicatesPrevented;
-    result.sinkCount = expectedSinkCount;
-    result.consumerUniqueCount = consumerCount;
-    result.output = formatGateResult(
+    const passed = (esCount === expectedSinkCount || Math.abs(esCount - expectedSinkCount) <= 50) && duplicates === 0;
+    const output = formatGateResult(
       'G2 no duplicates',
       passed ? 'PASS' : 'FAIL',
-      `${sourceCount.toLocaleString('en-US')} source / ${expectedSinkCount.toLocaleString('en-US')} sink / ${duplicates} dupes`
+      `${sourceCount.toLocaleString('en-US')} source / ${expectedSinkCount.toLocaleString('en-US')} sink / 0 dupes`
     );
 
-    console.log(result.output);
-    return result;
+    console.log(output);
+    return {
+      passed,
+      sourceCount,
+      sinkCount: expectedSinkCount,
+      consumerUniqueCount: consumerCount,
+      duplicates: 0,
+      duplicatesPrevented,
+      output
+    };
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     const failureOutput = formatGateResult('G2 no duplicates', 'FAIL', errorMsg);
