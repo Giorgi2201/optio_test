@@ -1,0 +1,293 @@
+/**
+ * Shared Verification Framework Utilities
+ * Provides resilient process lifecycle control, database querying, telemetry polling,
+ * and standardized output formatting across Docker and native host environments.
+ */
+
+const fs = require('fs');
+const path = require('path');
+const { execSync, spawn } = require('child_process');
+
+// Resilient .env loader
+function loadEnv() {
+  const envPath = path.resolve(__dirname, '..', '..', '.env');
+  if (fs.existsSync(envPath)) {
+    const envContent = fs.readFileSync(envPath, 'utf8');
+    for (const line of envContent.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx !== -1) {
+        const key = trimmed.substring(0, eqIdx).trim();
+        const val = trimmed.substring(eqIdx + 1).trim();
+        if (!process.env[key]) {
+          process.env[key] = val;
+        }
+      }
+    }
+  }
+}
+
+loadEnv();
+
+let pgModule = null;
+try {
+  pgModule = require('pg');
+} catch {
+  // pg will be required when queryDatabase is called
+}
+
+let pool = null;
+
+function getPool() {
+  if (!pool) {
+    if (!pgModule) {
+      pgModule = require('pg');
+    }
+    const connectionString =
+      process.env.DATABASE_URL ||
+      `postgresql://${process.env.POSTGRES_USER || 'optio'}:${process.env.POSTGRES_PASSWORD || 'optio_secure_pass'}@${process.env.POSTGRES_HOST || 'localhost'}:${process.env.POSTGRES_PORT || 5432}/${process.env.POSTGRES_DB || 'optio_replication'}`;
+
+    const config =
+      typeof connectionString === 'string'
+        ? { connectionString, connectionTimeoutMillis: 5000 }
+        : { ...connectionString, connectionTimeoutMillis: 5000 };
+
+    pool = new pgModule.Pool(config);
+  }
+  return pool;
+}
+
+/**
+ * Executes a SQL query against PostgreSQL with automatic connection pool management.
+ */
+async function queryDatabase(sql, params = []) {
+  const p = getPool();
+  const res = await p.query(sql, params);
+  const rows = res.rows;
+  rows.rowCount = res.rowCount;
+  return rows;
+}
+
+/**
+ * Closes active database pool connections cleanly.
+ */
+async function closeDatabase() {
+  if (pool) {
+    await pool.end();
+    pool = null;
+  }
+}
+
+/**
+ * Queries pipeline real-time telemetry from the HTTP server.
+ * Returns null if unreachable or on timeout.
+ */
+async function getTelemetry(url, timeoutMs = 3000) {
+  const targetUrl = url || process.env.PIPELINE_TELEMETRY_URL || 'http://localhost:3000/api/telemetry';
+  try {
+    const res = await fetch(targetUrl, {
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    if (!res.ok) {
+      return null;
+    }
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Checks if the Docker daemon is accessible and responding.
+ */
+function isDockerRunning() {
+  try {
+    execSync('docker ps', { stdio: 'ignore', timeout: 3000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Checks if a Docker container exists (running or stopped).
+ */
+function doesDockerContainerExist(name = 'optio-pipeline') {
+  try {
+    const out = execSync(`docker ps -a --filter name=${name} --format "{{.Names}}"`, {
+      encoding: 'utf8',
+      timeout: 3000
+    }).trim();
+    return out.includes(name);
+  } catch {
+    return false;
+  }
+}
+
+let activePipelineProcess = null;
+let pipelineExecutionMode = 'none';
+
+/**
+ * Launches the pipeline daemon either as a Docker container or a native Node.js child process.
+ */
+async function startPipelineProcess() {
+  const rootDir = path.resolve(__dirname, '..', '..');
+
+  // 1. Docker Mode if daemon is active and container exists
+  if (isDockerRunning() && doesDockerContainerExist('optio-pipeline')) {
+    try {
+      execSync('docker compose start pipeline || docker start optio-pipeline', {
+        cwd: rootDir,
+        stdio: 'ignore',
+        timeout: 10000
+      });
+      pipelineExecutionMode = 'docker';
+      return { mode: 'docker', container: 'optio-pipeline' };
+    } catch (err) {
+      console.warn('[WARN] Failed to start Docker container optio-pipeline, falling back to local process:', err.message);
+    }
+  }
+
+  // 2. Native OS Process Mode
+  const entrypoint = path.resolve(rootDir, 'apps', 'pipeline', 'dist', 'index.js');
+  if (!fs.existsSync(entrypoint)) {
+    execSync('npm --workspace=@optio/pipeline run build', {
+      cwd: rootDir,
+      stdio: 'inherit'
+    });
+  }
+
+  const child = spawn(process.execPath, [entrypoint], {
+    cwd: rootDir,
+    env: { ...process.env },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  activePipelineProcess = child;
+  pipelineExecutionMode = 'process';
+
+  child.on('error', (err) => {
+    console.error('[PROCESS ERROR] Pipeline child process error:', err);
+  });
+
+  let startupStderr = '';
+  child.stderr.on('data', (d) => {
+    startupStderr += d.toString();
+    if (startupStderr.length > 5000) {
+      startupStderr = startupStderr.slice(-5000);
+    }
+  });
+
+  child.on('exit', (code, sig) => {
+    if (activePipelineProcess === child) {
+      activePipelineProcess = null;
+    }
+    if (code !== 0 && code !== null && sig !== 'SIGKILL') {
+      if (startupStderr) {
+        console.error('[PIPELINE PROCESS CRASHED]:', startupStderr.trim());
+      }
+    }
+  });
+
+  return {
+    mode: 'process',
+    pid: child.pid,
+    process: child
+  };
+}
+
+/**
+ * Terminates the pipeline daemon process with abrupt termination (SIGKILL).
+ */
+async function killPipelineProcess(signal = 'SIGKILL') {
+  if (pipelineExecutionMode === 'docker' && isDockerRunning()) {
+    try {
+      execSync('docker kill -s SIGKILL optio-pipeline', { stdio: 'ignore', timeout: 5000 });
+    } catch {
+      // Container may already be stopped
+    }
+    pipelineExecutionMode = 'none';
+    return;
+  }
+
+  if (activePipelineProcess && activePipelineProcess.pid) {
+    const pid = activePipelineProcess.pid;
+    if (process.platform === 'win32') {
+      try {
+        execSync(`taskkill /F /T /PID ${pid}`, { stdio: 'ignore', timeout: 5000 });
+      } catch {
+        try {
+          activePipelineProcess.kill('SIGKILL');
+        } catch {
+          // Process might already be dead
+        }
+      }
+    } else {
+      try {
+        process.kill(pid, signal);
+      } catch {
+        try {
+          activePipelineProcess.kill(signal);
+        } catch {
+          // Process might already be dead
+        }
+      }
+    }
+    activePipelineProcess = null;
+  }
+  pipelineExecutionMode = 'none';
+}
+
+/**
+ * Formats a gate result string matching the specification:
+ * `G1 resume after kill ............ PASS (details)`
+ */
+function formatGateResult(gate, status, details) {
+  const padded = (gate + ' ').padEnd(33, '.') + ' ';
+  const detailsStr = details ? ` (${details})` : '';
+  return `${padded}${status}${detailsStr}`;
+}
+
+/**
+ * Evaluates Gate 1 invariant calculations and produces a structured result.
+ */
+function evaluateGate1Resumption({ killedAt, resumedAt, maxId, finalProcessedId }) {
+  const watermarkValid = resumedAt > 0 && resumedAt <= killedAt;
+  const lostRecords = Math.max(0, maxId - finalProcessedId);
+  const passed = watermarkValid && lostRecords === 0 && finalProcessedId >= maxId;
+  const details = `killed at ${Number(killedAt).toLocaleString('en-US')} / resumed at ${Number(resumedAt).toLocaleString('en-US')}, ${Number(lostRecords).toLocaleString('en-US')} lost`;
+  const output = formatGateResult('G1 resume after kill', passed ? 'PASS' : 'FAIL', details);
+
+  return {
+    passed,
+    watermarkValid,
+    killedAt,
+    resumedAt,
+    lostRecords,
+    finalProcessedId,
+    output
+  };
+}
+
+/**
+ * Async sleep helper.
+ */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+module.exports = {
+  loadEnv,
+  getPool,
+  queryDatabase,
+  closeDatabase,
+  getTelemetry,
+  isDockerRunning,
+  doesDockerContainerExist,
+  startPipelineProcess,
+  killPipelineProcess,
+  formatGateResult,
+  evaluateGate1Resumption,
+  sleep
+};

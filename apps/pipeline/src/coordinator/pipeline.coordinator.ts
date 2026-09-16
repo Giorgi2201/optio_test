@@ -176,6 +176,8 @@ export class PipelineCoordinator {
     }
 
     return {
+      status: this.status,
+      backfill_status: backfillMetrics.status,
       backfill_cursor: backfillMetrics.lastProcessedId,
       backfill_total_records: sourceMetadata.totalCount,
       backfill_completion_pct: backfillCompletionPct,

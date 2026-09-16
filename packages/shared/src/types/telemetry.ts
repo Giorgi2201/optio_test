@@ -28,7 +28,13 @@ export interface CircuitBreakerTelemetry {
   isThrottling?: boolean;
 }
 
+import { PipelineStatus } from './resilience.js';
+
+export type CoordinatorStatus = 'INITIALIZED' | 'RUNNING' | 'STOPPED';
+
 export interface PipelineTelemetry {
+  status?: CoordinatorStatus;
+  backfill_status?: PipelineStatus;
   backfill_cursor: number;
   backfill_total_records: number;
   backfill_completion_pct: number;
