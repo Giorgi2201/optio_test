@@ -579,6 +579,96 @@ function evaluateGate4PartialFailure(writtenCount, dlqCount, batchRolledBack = f
 }
 
 /**
+ * Evaluates Gate 5 observability and introspection invariants.
+ * Validates that all 5 fundamental operational questions can be answered:
+ * 1. Where is the backfill? (backfill_cursor, backfill_completion_pct)
+ * 2. What is current throughput? (current_throughput_eps >= 0)
+ * 3. How much incremental lag is there? (incremental_lag_records, incremental_lag_ms)
+ * 4. How many records are in the DLQ? (dlq_pending_count >= 0)
+ * 5. Is the system healthy? (health.overall in ['HEALTHY', 'DEGRADED', 'DOWN'] with component healths)
+ */
+function evaluateGate5Observability(telemetry) {
+  if (!telemetry || typeof telemetry !== 'object') {
+    const output = formatGateResult('G5 observability', 'FAIL', 'no telemetry payload received');
+    return {
+      passed: false,
+      answers: null,
+      details: 'no telemetry payload received',
+      output
+    };
+  }
+
+  const reasons = [];
+
+  // Q1: Where is the backfill?
+  const q1Valid =
+    typeof telemetry.backfill_cursor === 'number' &&
+    typeof telemetry.backfill_completion_pct === 'number';
+  if (!q1Valid) {
+    reasons.push('missing or invalid backfill position (cursor / completion pct)');
+  }
+
+  // Q2: What is the current throughput?
+  const q2Valid =
+    typeof telemetry.current_throughput_eps === 'number' &&
+    telemetry.current_throughput_eps >= 0;
+  if (!q2Valid) {
+    reasons.push('missing or negative throughput_eps');
+  }
+
+  // Q3: How much incremental lag is there?
+  const q3Valid =
+    typeof telemetry.incremental_lag_records === 'number' &&
+    typeof telemetry.incremental_lag_ms === 'number' &&
+    telemetry.incremental_lag_records >= 0 &&
+    telemetry.incremental_lag_ms >= 0;
+  if (!q3Valid) {
+    reasons.push('missing or invalid incremental lag metrics');
+  }
+
+  // Q4: How many records are in the DLQ?
+  const q4Valid =
+    typeof telemetry.dlq_pending_count === 'number' &&
+    telemetry.dlq_pending_count >= 0;
+  if (!q4Valid) {
+    reasons.push('missing or negative dlq_pending_count');
+  }
+
+  // Q5: Is the system healthy?
+  const validHealthStates = ['HEALTHY', 'DEGRADED', 'DOWN'];
+  const overallValid = Boolean(validHealthStates.includes(telemetry.health?.overall));
+  const pgValid = Boolean(telemetry.health?.postgres && typeof telemetry.health.postgres.status === 'string');
+  const esValid = Boolean(telemetry.health?.elasticsearch && typeof telemetry.health.elasticsearch.status === 'string');
+  const rmqValid = Boolean(telemetry.health?.rabbitmq && typeof telemetry.health.rabbitmq.status === 'string');
+  const q5Valid = Boolean(overallValid && pgValid && esValid && rmqValid);
+  if (!q5Valid) {
+    reasons.push('missing or invalid health status structure');
+  }
+
+  const passed = Boolean(q1Valid && q2Valid && q3Valid && q4Valid && q5Valid);
+
+  const answers = passed
+    ? {
+        backfillPosition: `cursor: ${telemetry.backfill_cursor} (${telemetry.backfill_completion_pct}%)`,
+        throughputEps: `${telemetry.current_throughput_eps} eps`,
+        incrementalLag: `${telemetry.incremental_lag_records} records (${telemetry.incremental_lag_ms}ms)`,
+        dlqPending: `${telemetry.dlq_pending_count} pending`,
+        systemHealth: telemetry.health.overall
+      }
+    : null;
+
+  const details = reasons.join(', ');
+  const output = formatGateResult('G5 observability', passed ? 'PASS' : 'FAIL', details);
+
+  return {
+    passed,
+    answers,
+    details,
+    output
+  };
+}
+
+/**
  * Async sleep helper.
  */
 function sleep(ms) {
@@ -606,5 +696,6 @@ module.exports = {
   evaluateGate2Deduplication,
   evaluateGate3Outage,
   evaluateGate4PartialFailure,
+  evaluateGate5Observability,
   sleep
 };

@@ -21,7 +21,8 @@
     "seed": "node scripts/seed.js",
     "seed:dry": "node scripts/seed.js --dry-run",
     "seed:fresh": "node scripts/seed.js --fresh",
-    "probe": "node scripts/env-probe.js"
+    "probe": "node scripts/env-probe.js",
+    "verify": "node scripts/verify/index.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
