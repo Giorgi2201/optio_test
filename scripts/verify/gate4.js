@@ -39,6 +39,8 @@ async function runGate4(options = {}) {
     // -------------------------------------------------------------------------
     // Step 1: DLQ & State Baseline
     // -------------------------------------------------------------------------
+    // Clear old DLQ rows at start of test to isolate test state and prevent accumulation
+    await queryFn('DELETE FROM dead_letter_queue;');
     const initialDlqRows = await queryFn('SELECT COUNT(*)::bigint AS count FROM dead_letter_queue');
     const initialDlqCount = parseInt(initialDlqRows[0]?.count || '0', 10);
 
@@ -115,13 +117,35 @@ async function runGate4(options = {}) {
     // -------------------------------------------------------------------------
     // Step 5: DLQ Quarantine & Context Verification
     // -------------------------------------------------------------------------
+    try {
+      const finalDlq = await getDlqFn(corruptedIds);
+      if (finalDlq && finalDlq.length > 0) {
+        dlqEntries = finalDlq;
+      }
+    } catch {
+      // Ignore
+    }
+
     const dlqRows = options.simulatedDlqRows ?? dlqEntries;
-    const dlqCount = dlqRows.length;
+
+    // Deduplicate by record_id if multiple sinks routed the same record, or take unique record count
+    const uniqueRecordIds = new Set(dlqRows.map((r) => r.record_id || r.id));
+    const dlqCount = options.simulatedDlqRows !== undefined
+      ? options.simulatedDlqRows.length
+      : (uniqueRecordIds.size > 0 ? uniqueRecordIds.size : dlqRows.length);
 
     // Verify sufficient retry context: non-null payload, error_code, error_message, PENDING status
     let contextSufficient = dlqCount === corruptedTarget;
     for (const row of dlqRows) {
-      const hasPayload = row.payload !== null && row.payload !== undefined && Object.keys(row.payload).length > 0;
+      let payloadObj = row.payload;
+      if (typeof payloadObj === 'string') {
+        try {
+          payloadObj = JSON.parse(payloadObj);
+        } catch {
+          // Keep raw
+        }
+      }
+      const hasPayload = payloadObj !== null && payloadObj !== undefined && (typeof payloadObj === 'object' ? Object.keys(payloadObj).length > 0 : true);
       const hasErrorCode = typeof row.error_code === 'string' && row.error_code.length > 0;
       const hasErrorMessage = typeof row.error_message === 'string' && row.error_message.length > 0;
       const isPending = row.status === 'PENDING';

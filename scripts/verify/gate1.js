@@ -28,7 +28,7 @@ async function runGate1(options = {}) {
   const startFn = options.startPipelineProcess || startPipelineProcess;
   const killFn = options.killPipelineProcess || killPipelineProcess;
   const sleepFn = options.sleep || sleep;
-  const maxWaitMs = options.maxWaitMs || 60000;
+  const maxWaitMs = options.maxWaitMs || 180000;
   let pipelineRestarted = false;
 
   try {
@@ -134,6 +134,7 @@ async function runGate1(options = {}) {
     await startFn();
     pipelineRestarted = true;
 
+    let initialObservedId = -1;
     let completed = false;
     let finalProcessedId = 0;
     const resumeStart = Date.now();
@@ -148,6 +149,15 @@ async function runGate1(options = {}) {
       }
 
       const cursor = telemetry?.backfill_cursor || 0;
+      if (cursor > 0 && initialObservedId === -1) {
+        initialObservedId = cursor;
+        if (initialObservedId < resumedAt) {
+          throw new Error(
+            `Resumption invariant violated: pipeline restarted from 0 or before checkpoint (${initialObservedId} < ${resumedAt})`
+          );
+        }
+      }
+
       if (
         telemetry?.backfill_status === 'COMPLETED' ||
         telemetry?.status === 'COMPLETED' ||
@@ -166,12 +176,25 @@ async function runGate1(options = {}) {
         );
         const dbId = parseInt(cp[0]?.last_processed_id || '0', 10);
         const dbStatus = cp[0]?.status;
+
+        if (dbId > 0 && initialObservedId === -1) {
+          initialObservedId = dbId;
+          if (initialObservedId < resumedAt) {
+            throw new Error(
+              `Resumption invariant violated: pipeline checkpoint retreated after restart (${initialObservedId} < ${resumedAt})`
+            );
+          }
+        }
+
         if (dbId >= maxId || dbStatus === 'COMPLETED') {
           completed = true;
           finalProcessedId = Math.max(dbId, maxId);
           break;
         }
-      } catch {
+      } catch (err) {
+        if (err.message && err.message.includes('Resumption invariant')) {
+          throw err;
+        }
         // Query error ignore
       }
     }

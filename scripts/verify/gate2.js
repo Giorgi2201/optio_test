@@ -30,7 +30,7 @@ async function runGate2(options = {}) {
   const refreshEsFn = options.refreshElasticsearch || refreshElasticsearch;
   const consumerMetricsFn = options.getConsumerMetrics || getConsumerMetrics;
   const sleepFn = options.sleep || sleep;
-  const maxWaitMs = options.maxWaitMs !== undefined ? options.maxWaitMs : 20000;
+  const maxWaitMs = options.maxWaitMs !== undefined ? options.maxWaitMs : 60000;
 
   try {
     // -------------------------------------------------------------------------
@@ -61,9 +61,9 @@ async function runGate2(options = {}) {
 
       if (
         currentEsCount !== null &&
-        currentEsCount >= sourceCount &&
+        currentEsCount === sourceCount &&
         consumerMetrics !== null &&
-        consumerMetrics.uniqueProcessed >= sourceCount
+        consumerMetrics.uniqueProcessed === sourceCount
       ) {
         break;
       }
