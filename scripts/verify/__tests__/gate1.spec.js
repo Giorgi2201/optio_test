@@ -112,9 +112,9 @@ describe('Gate 1 Verification - Crash Recovery & Watermark Resumption', () => {
         return [{ count: '5000', max_id: '5000' }];
       }
       if (sql.includes('replication_checkpoints') && sql.includes('SELECT')) {
-        // First check post-kill returns 2000, final check returns 5000
+        // Initial watermark: 0, post-kill watermark: 2000, final completed: 5000
         return [{
-          last_processed_id: killEvents.length > 0 && startEvents.length > 1 ? '5000' : '2000',
+          last_processed_id: killEvents.length > 0 && startEvents.length > 1 ? '5000' : (killEvents.length > 0 ? '2000' : '0'),
           status: 'COMPLETED'
         }];
       }

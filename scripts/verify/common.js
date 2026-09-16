@@ -188,25 +188,25 @@ let pipelineExecutionMode = 'none';
 async function startPipelineProcess() {
   const rootDir = path.resolve(__dirname, '..', '..');
 
-  // If pipeline is already responding via HTTP, don't spawn another one
-  const existingTelemetry = await getTelemetry(null, 1000);
-  if (existingTelemetry) {
-    return { mode: pipelineExecutionMode || 'running', existing: true };
-  }
-
   // 1. Docker Mode if daemon is active and container exists
   if (isDockerRunning() && doesDockerContainerExist('optio-pipeline')) {
     try {
-      execSync('docker compose start pipeline || docker start optio-pipeline', {
+      execSync('docker compose restart pipeline || docker restart optio-pipeline', {
         cwd: rootDir,
         stdio: 'ignore',
-        timeout: 10000
+        timeout: 15000
       });
       pipelineExecutionMode = 'docker';
-      return { mode: 'docker', container: 'optio-pipeline' };
+      return { mode: 'docker', container: 'optio-pipeline', action: 'restarted' };
     } catch (err) {
-      console.warn('[WARN] Failed to start Docker container optio-pipeline, falling back to local process:', err.message);
+      console.warn('[WARN] Failed to restart Docker container optio-pipeline, falling back to local process:', err.message);
     }
+  }
+
+  // 2. If pipeline is already responding via HTTP, don't spawn another one
+  const existingTelemetry = await getTelemetry(null, 1000);
+  if (existingTelemetry) {
+    return { mode: pipelineExecutionMode || 'running', existing: true };
   }
 
   // 2. Native OS Process Mode

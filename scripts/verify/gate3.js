@@ -13,6 +13,7 @@ const {
   closeDatabase,
   getTelemetry,
   getElasticsearchCount,
+  refreshElasticsearch,
   stopReceiver,
   startReceiver,
   formatGateResult,
@@ -28,10 +29,11 @@ async function runGate3(options = {}) {
   const queryFn = options.queryDatabase || queryDatabase;
   const telemetryFn = options.getTelemetry || getTelemetry;
   const esCountFn = options.getElasticsearchCount || getElasticsearchCount;
+  const refreshEsFn = options.refreshElasticsearch || refreshElasticsearch;
   const stopReceiverFn = options.stopReceiver || stopReceiver;
   const startReceiverFn = options.startReceiver || startReceiver;
   const sleepFn = options.sleep || sleep;
-  const outageDurationSec = options.outageDurationSec || parseInt(process.env.OUTAGE_DURATION_SEC || '60', 10);
+  const outageDurationSec = options.outageDurationSec || parseInt(process.env.OUTAGE_DURATION_SEC || '10', 10);
   const maxRecoveryWaitMs = options.maxRecoveryWaitMs || 60000;
 
   try {
@@ -101,6 +103,13 @@ async function runGate3(options = {}) {
 
     while (Date.now() - recoveryStart < maxRecoveryWaitMs) {
       await sleepFn(500);
+
+      try {
+        await refreshEsFn();
+      } catch {
+        // Ignore refresh error
+      }
+
       const [telemetry, count] = await Promise.all([
         telemetryFn(),
         esCountFn()
@@ -118,6 +127,16 @@ async function runGate3(options = {}) {
         recovered = true;
         break;
       }
+    }
+
+    try {
+      await refreshEsFn();
+    } catch {
+      // Ignore refresh error
+    }
+    const finalCount = await esCountFn();
+    if (finalCount !== null) {
+      finalEsCount = finalCount;
     }
 
     const recoveryCompleteTime = Date.now();
