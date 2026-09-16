@@ -115,59 +115,62 @@ ALL RESILIENCE GATES PASSED [5/5]
 ```mermaid
 flowchart TD
     subgraph Source["PostgreSQL (ACID Single Source of Truth)"]
-        SR[(source_records\nid BIGSERIAL, updated_at TIMESTAMPTZ\nstatus, payload JSONB)]
-        CP[(replication_checkpoints\npipeline_id, last_processed_id\nlast_processed_timestamp, status)]
-        DLQ[(replication_dlq\nrecord_id, sink_target, payload\nerror_code, error_message, status)]
+        SR[("source_records<br/>id BIGSERIAL, updated_at TIMESTAMPTZ(3)<br/>status, payload JSONB")]
+        CP[("replication_checkpoints<br/>pipeline_id, last_processed_id<br/>last_processed_timestamp, status")]
+        DLQ[("dead_letter_queue<br/>record_id, sink_target, payload<br/>error_code, error_message, status")]
     end
 
     subgraph PipelineDaemon["Replication Daemon Engine (apps/pipeline :3000)"]
-        SR_READER[SourceReader\nO(1) Memory Keyset Paging]
-        COORD[PipelineCoordinator\nDual-Mode Runner Supervisor]
-        BF[BackfillRunner\nMonotonic Paging WHERE id > :id]
-        INC[IncrementalRunner\nComposite Watermark WHERE (ts, id) > (last_ts, last_id)]
-        VAL[Batch Decomposer &\nSchema Validation Filter]
+        SR_READER["SourceReader<br/>O(1) Memory Keyset Paging"]
+        COORD["PipelineCoordinator<br/>Dual-Mode Runner Supervisor"]
+        BF["BackfillRunner<br/>Monotonic Keyset Seek: WHERE id > :id"]
+        INC["IncrementalRunner<br/>Composite Watermark: (updated_at, id)"]
+        VAL["Batch Decomposer &amp;<br/>Schema Validation Filter"]
         
         subgraph Resilience["Resilience Core"]
-            CB_ES[CircuitBreaker: Elasticsearch\nCLOSED / OPEN / HALF-OPEN\nJittered Backoff 1s -> 30s]
-            CB_RMQ[CircuitBreaker: RabbitMQ\nCLOSED / OPEN / HALF-OPEN\nJittered Backoff 1s -> 30s]
+            CB_ES["CircuitBreaker: Elasticsearch<br/>CLOSED / OPEN / HALF-OPEN<br/>Jittered Backoff 1s to 30s"]
+            CB_RMQ["CircuitBreaker: RabbitMQ<br/>CLOSED / OPEN / HALF-OPEN<br/>Jittered Backoff 1s to 30s"]
         end
 
-        TELEMETRY[Telemetry Engine\nThroughput / Lag / Health]
-        HTTP_API[HTTP Control & Telemetry Server\n/health, /api/telemetry, /api/dlq]
+        TELEMETRY["Telemetry Engine<br/>Throughput / Lag / Health"]
+        HTTP_API["HTTP Control &amp; Telemetry Server<br/>/health, /api/telemetry, /api/dlq"]
     end
 
     subgraph DownstreamSinks["Heterogeneous Dual Sinks"]
-        ES[(Elasticsearch Cluster :9200\nIndex: records_search_index\n_id = source_records.id\ndoc_as_upsert: true)]
-        RMQ[RabbitMQ Broker :5672\nExchange: replication.events\nConfirmChannel + Publisher Confirms]
+        ES[("Elasticsearch Cluster :9200<br/>Index: records_search_index<br/>_id = source_records.id<br/>doc_as_upsert: true")]
+        RMQ["RabbitMQ Broker :5672<br/>Exchange: replication.events<br/>ConfirmChannel + Publisher Confirms"]
     end
 
     subgraph ConsumerService["Independent Consumer Worker (apps/consumer :3001)"]
-        AMQP_SUB[AMQP Consumer\nQueue: replication.events.queue]
-        DEDUP[Sliding-Window Dedup Cache\nBounded 500,000 Keys (FIFO Eviction)\nKey: rec_${id}_v${version}]
-        WORKER[Business Event Processor\nAtomic Execution & Consumer Ack]
+        AMQP_SUB["AMQP Consumer<br/>Queue: replication.events.queue"]
+        DEDUP["Sliding-Window Dedup Cache<br/>Bounded 500,000 Keys (FIFO Eviction)<br/>Key: rec_{id}_v{version}"]
+        WORKER["Business Event Processor<br/>Atomic Execution &amp; Consumer Ack"]
     end
 
     subgraph ObservabilityPlane["Operational Control Console (apps/ui :4000)"]
-        UI_CONSOLE[React / Vite / Tailwind UI\nHigh-Density Utilitarian Panels\n1.5s Polling Engine & Proxy]
+        UI_CONSOLE["React / Vite / Tailwind UI<br/>High-Density Utilitarian Panels<br/>1.5s Polling Engine &amp; Proxy"]
     end
 
     %% Data Extraction
     SR -->|Indexed Monotonic Seek| SR_READER
     SR_READER --> BF
     SR_READER --> INC
-    BF & INC --> COORD
+    BF --> COORD
+    INC --> COORD
     COORD --> VAL
 
     %% Poison Pill Quarantine
-    VAL -->|Valid Batches (e.g. 497/500)| CB_ES & CB_RMQ
-    VAL -->|Poison Pills (e.g. 3/500)\nQuarantine with Diagnostics| DLQ
+    VAL -->|Valid Batches: 497/500| CB_ES
+    VAL -->|Valid Batches: 497/500| CB_RMQ
+    VAL -->|Poison Pills: 3/500<br/>Quarantine with Diagnostics| DLQ
 
     %% Sink Ingestion
     CB_ES -->|Bulk Upsert with doc_as_upsert| ES
     CB_RMQ -->|Durable Publish with Confirms| RMQ
 
     %% Post-Ack Atomic Commit Rule
-    ES & RMQ -.->|Dual Sink Acknowledgments Confirmed| COORD
+    ES -.->|Dual Sink Confirmed| COORD
+    RMQ -.->|Dual Sink Confirmed| COORD
     COORD -->|Commit Watermark Strictly Post-ACK| CP
 
     %% Consumer Flow

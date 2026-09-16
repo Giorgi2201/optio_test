@@ -19,46 +19,49 @@ The **Kill It Twice Replication Platform** is a production-grade, fault-tolerant
 ```mermaid
 flowchart TD
     subgraph Source["Source Database (ACID Single Source of Truth)"]
-        PG[(PostgreSQL\nsource_records)]
-        CP[(PostgreSQL\nreplication_checkpoints)]
-        DLQ[(PostgreSQL\nreplication_dlq)]
+        PG[("PostgreSQL<br/>source_records")]
+        CP[("PostgreSQL<br/>replication_checkpoints")]
+        DLQ[("PostgreSQL<br/>replication_dlq")]
     end
 
     subgraph PipelineDaemon["Replication Daemon (apps/pipeline :3000)"]
-        COORD[Concurrency Coordinator\nPipelineCoordinator]
-        BF[Backfill Runner\nBounded Keyset Paging]
-        INC[Incremental CDC Poller\nComposite Watermark]
-        CB_ES[Circuit Breaker\nElasticsearch Breaker]
-        CB_RMQ[Circuit Breaker\nRabbitMQ Breaker]
-        VAL[Poison Pill Isolation\n& DLQ Quarantine]
-        HTTP_API[HTTP Telemetry &\nControl Server]
+        COORD["Concurrency Coordinator<br/>PipelineCoordinator"]
+        BF["Backfill Runner<br/>Bounded Keyset Paging"]
+        INC["Incremental CDC Poller<br/>Composite Watermark"]
+        CB_ES["Circuit Breaker<br/>Elasticsearch Breaker"]
+        CB_RMQ["Circuit Breaker<br/>RabbitMQ Breaker"]
+        VAL["Poison Pill Isolation<br/>&amp; DLQ Quarantine"]
+        HTTP_API["HTTP Telemetry &amp;<br/>Control Server"]
     end
 
     subgraph DownstreamSinks["Downstream Heterogeneous Sinks"]
-        ES[(Elasticsearch Cluster :9200\nrecords_search_index)]
-        RMQ[RabbitMQ Broker :5672\nreplication.events]
+        ES[("Elasticsearch Cluster :9200<br/>records_search_index")]
+        RMQ["RabbitMQ Broker :5672<br/>replication.events"]
     end
 
     subgraph Consumers["Downstream Microservices"]
-        CONS[Independent Consumer\napps/consumer :3001\nSliding-Window Dedup]
+        CONS["Independent Consumer<br/>apps/consumer :3001<br/>Sliding-Window Dedup"]
     end
 
     subgraph Observability["Operational Control Plane"]
-        UI[Operational Console\napps/ui :4000\nNginx + Vite/React]
+        UI["Operational Console<br/>apps/ui :4000<br/>Nginx + Vite/React"]
     end
 
     PG -->|Monotonic Keyset Stream| BF
-    PG -->|Composite Watermark (ts, id)| INC
-    BF & INC --> COORD
+    PG -->|Composite Watermark: ts, id| INC
+    BF --> COORD
+    INC --> COORD
     COORD --> VAL
-    VAL -->|Valid Batches| CB_ES & CB_RMQ
+    VAL -->|Valid Batches| CB_ES
+    VAL -->|Valid Batches| CB_RMQ
     VAL -->|Isolated Poison Pills| DLQ
-    CB_ES -->|Bulk Upsert (doc_as_upsert)| ES
+    CB_ES -->|Bulk Upsert: doc_as_upsert| ES
     CB_RMQ -->|Publisher Confirms| RMQ
-    RMQ -->|AMQP Consume & Ack| CONS
-    CB_ES & CB_RMQ -->|Atomic Post-ACK Commit| CP
+    RMQ -->|AMQP Consume &amp; Ack| CONS
+    CB_ES -.->|Atomic Post-ACK Commit| CP
+    CB_RMQ -.->|Atomic Post-ACK Commit| CP
     COORD -.->|Live Telemetry /api/telemetry| HTTP_API
-    HTTP_API -.->|Proxy /api & /health| UI
+    HTTP_API -.->|Proxy /api &amp; /health| UI
 ```
 
 ### 1.1 Dual-Mode Concurrent Execution
