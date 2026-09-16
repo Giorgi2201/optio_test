@@ -11,7 +11,8 @@
   "scripts": {
     "build": "npm --workspace=@optio/shared run build",
     "build:shared": "npm --workspace=@optio/shared run build",
-    "typecheck": "tsc --noEmit && npm --workspace=@optio/shared run typecheck",
+    "test": "npm --workspace=@optio/pipeline run test",
+    "typecheck": "tsc --noEmit && npm --workspace=@optio/shared run typecheck && npm --workspace=@optio/pipeline run typecheck",
     "typecheck:shared": "npm --workspace=@optio/shared run typecheck",
     "migrate": "node scripts/migrate.js",
     "seed": "node scripts/seed.js",
