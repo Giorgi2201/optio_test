@@ -20,8 +20,8 @@ CREATE TABLE IF NOT EXISTS source_records (
     version INTEGER NOT NULL DEFAULT 1,
     status VARCHAR(32) NOT NULL DEFAULT 'ACTIVE',
     is_corrupted BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ(3) NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ(3) NOT NULL DEFAULT NOW()
 );
 
 -- Index: B-tree on id ASC for O(1) memory keyset seek queries (Backfill Cursor)
@@ -49,12 +49,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_source_records_uuid
 CREATE TABLE IF NOT EXISTS replication_checkpoints (
     pipeline_id VARCHAR(64) PRIMARY KEY,
     last_processed_id BIGINT NOT NULL DEFAULT 0,
-    last_processed_timestamp TIMESTAMPTZ NULL,
+    last_processed_timestamp TIMESTAMPTZ(3) NULL,
     status VARCHAR(32) NOT NULL DEFAULT 'INITIALIZED',
     records_processed BIGINT NOT NULL DEFAULT 0,
     records_failed BIGINT NOT NULL DEFAULT 0,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ(3) NOT NULL DEFAULT NOW()
 );
 
 -- Seed Initial Pipeline Checkpoint Records (Idempotent)
@@ -108,8 +108,8 @@ CREATE TABLE IF NOT EXISTS dead_letter_queue (
     stack_trace TEXT NULL,
     retry_count INTEGER NOT NULL DEFAULT 0,
     status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    last_retried_at TIMESTAMPTZ NULL
+    created_at TIMESTAMPTZ(3) NOT NULL DEFAULT NOW(),
+    last_retried_at TIMESTAMPTZ(3) NULL
 );
 
 -- Composite Index: Efficient retrieval and re-drive ordered by age
