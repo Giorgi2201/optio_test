@@ -12,3 +12,4 @@ export * from './checkpoint/checkpoint.manager.js';
 export * from './dlq/dlq.store.js';
 export * from './resilience/circuit-breaker.js';
 export * from './runners/backfill.runner.js';
+export * from './runners/incremental.runner.js';
