@@ -1,0 +1,17 @@
+{
+  "name": "@optio/shared",
+  "version": "1.0.0",
+  "description": "Shared domain models, sink schemas, and resilience contracts for OPTIO",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": ["replication", "domain", "contracts", "types"],
+  "author": "OPTIO Platform Engineering",
+  "license": "ISC",
+  "devDependencies": {
+    "typescript": "^5.4.5"
+  }
+}
