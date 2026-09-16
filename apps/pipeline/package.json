@@ -12,10 +12,12 @@
   "dependencies": {
     "@elastic/elasticsearch": "^8.13.0",
     "@optio/shared": "*",
+    "amqplib": "^0.10.4",
     "dotenv": "^16.4.5",
     "pg": "^8.11.5"
   },
   "devDependencies": {
+    "@types/amqplib": "^0.10.5",
     "@types/node": "^20.12.7",
     "@types/pg": "^8.11.5",
     "typescript": "^5.4.5"
