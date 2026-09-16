@@ -1,0 +1,34 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-zinc-950 text-zinc-200 font-sans text-sm antialiased selection:bg-zinc-800;
+    font-feature-settings: 'tnum' 1, 'cv11' 1;
+  }
+
+  /* Dense, low-contrast scrollbars consistent with the console surfaces. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #3f3f46 transparent;
+  }
+
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    background-color: #3f3f46;
+    border-radius: 2px;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
