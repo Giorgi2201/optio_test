@@ -1,0 +1,29 @@
+# Keep the Docker build context lean and hermetic: dependencies and build outputs are produced
+# inside the image, never copied from the host (host binaries such as esbuild are platform-specific).
+**/node_modules
+**/dist
+**/build
+**/coverage
+**/*.tsbuildinfo
+**/*.log
+
+.git
+.github
+.vscode
+.idea
+
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
+
+# Persistent data volumes
+.data
+pgdata
+esdata
+rabbitdata
+
+# Docs and harness artifacts are not needed inside application images
+docs
+test-results
+playwright-report

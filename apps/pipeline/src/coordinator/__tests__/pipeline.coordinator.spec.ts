@@ -107,14 +107,14 @@ describe('PipelineCoordinator - Dual-Mode Concurrency & Aggregated Observability
 
     const mockIncrementalMetrics: IncrementalMetrics = {
       pipelineId: 'incremental_pipeline',
-      status: 'RUNNING',
+      status: 'PAUSED',
       lastProcessedTimestamp: new Date('2026-09-16T10:10:00.000Z'),
       lastProcessedId: 1000,
       totalMutationsProcessed: 320,
       totalMutationsFailed: 1,
       lagRecords: 14,
       lagMs: 420,
-      isRunning: true
+      isRunning: false
     };
 
     const mockSourceMetadata: SourceMetadata = {
@@ -177,6 +177,12 @@ describe('PipelineCoordinator - Dual-Mode Concurrency & Aggregated Observability
     const telemetry: PipelineTelemetry = await coordinator.getTelemetry();
 
     // Verification of Gate 5 Telemetry Invariants
+    // Runner statuses must be reported independently and verbatim from each runner's metrics.
+    const expectedBackfillStatus: PipelineStatus = 'RUNNING';
+    const expectedIncrementalStatus: PipelineStatus = 'PAUSED';
+    assert.strictEqual(telemetry.backfill_status, expectedBackfillStatus);
+    assert.strictEqual(telemetry.incremental_status, expectedIncrementalStatus);
+
     assert.strictEqual(telemetry.backfill_cursor, 250000);
     assert.strictEqual(telemetry.backfill_total_records, 500000);
     assert.strictEqual(telemetry.backfill_completion_pct, 50); // 250000 / 500000 * 100
@@ -389,6 +395,8 @@ describe('PipelineCoordinator - Dual-Mode Concurrency & Aggregated Observability
       const telemBody = await telemRes.json() as PipelineTelemetry;
       assert.strictEqual(telemBody.backfill_cursor, 100);
       assert.strictEqual(telemBody.dlq_pending_count, 1);
+      assert.strictEqual(telemBody.backfill_status, 'RUNNING');
+      assert.strictEqual(telemBody.incremental_status, 'RUNNING');
 
       // 3. GET /api/dlq
       const dlqRes = await fetch(`${baseUrl}/api/dlq`);

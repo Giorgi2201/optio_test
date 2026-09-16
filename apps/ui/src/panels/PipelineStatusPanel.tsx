@@ -21,16 +21,20 @@ export function healthTone(status: ComponentHealth['status'] | PipelineTelemetry
   }
 }
 
+/**
+ * Runner status → tone. RUNNING emerald, PAUSED amber, FAILED rose; COMPLETED and INITIALIZED are
+ * terminal/idle states with nothing to act on, so they render neutral zinc.
+ */
 export function runnerTone(status: PipelineStatus | undefined): Tone {
   switch (status) {
     case 'RUNNING':
-    case 'COMPLETED':
       return 'ok';
     case 'PAUSED':
-    case 'INITIALIZED':
       return 'warn';
     case 'FAILED':
       return 'err';
+    case 'COMPLETED':
+    case 'INITIALIZED':
     default:
       return 'neutral';
   }
@@ -140,7 +144,10 @@ export function PipelineStatusPanel({ telemetry, isConnected }: { telemetry: Pip
             </SectionLabel>
             <div className="h-2 w-full border border-zinc-800 bg-zinc-950" role="progressbar" aria-valuenow={Math.round(pct)} aria-valuemin={0} aria-valuemax={100}>
               <div
-                className={cx('h-full transition-[width] duration-500', backfillStatus === 'FAILED' ? 'bg-rose-500' : backfillStatus === 'PAUSED' ? 'bg-amber-500' : 'bg-emerald-500')}
+                className={cx(
+                  'h-full transition-[width] duration-500',
+                  backfillStatus === 'FAILED' ? 'bg-rose-500' : backfillStatus === 'PAUSED' ? 'bg-amber-500' : backfillStatus === 'COMPLETED' ? 'bg-zinc-400' : 'bg-emerald-500'
+                )}
                 style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}
               />
             </div>

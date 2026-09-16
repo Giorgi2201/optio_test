@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Pause, Play, RefreshCw, RotateCcw } from 'lucide-react';
-import type { DLQEntry, PipelineTelemetry } from '@optio/shared';
+import type { DLQEntry, PipelineStatus, PipelineTelemetry } from '@optio/shared';
 import { api, ApiError } from '../api/client';
 import type { RunnerAction } from '../api/types';
 import { ActionLog } from '../components/ActionLog';
@@ -12,7 +12,8 @@ import { runnerTone } from './PipelineStatusPanel';
 
 const DLQ_FETCH_LIMIT = 50;
 
-type IncrementalLocalState = 'RUNNING' | 'PAUSED' | 'UNKNOWN';
+/** Runner status as reported by telemetry; UNKNOWN only while no snapshot has been received. */
+type RunnerStatus = PipelineStatus | 'UNKNOWN';
 
 function errorMessage(err: unknown): string {
   return err instanceof ApiError || err instanceof Error ? err.message : String(err);
@@ -40,14 +41,16 @@ function RunnerControls({
 }: {
   name: string;
   description: string;
-  status: string;
+  status: RunnerStatus;
   tone: Tone;
   detail: string;
   busy: RunnerAction | null;
   onAction: (action: RunnerAction) => void;
 }) {
-  const isPaused = status === 'PAUSED';
-  const isTerminal = status === 'COMPLETED' || status === 'FAILED';
+  // Pause is only meaningful while the runner loop is active.
+  const canPause = status === 'RUNNING';
+  // resume() restarts from the committed checkpoint: valid after a pause, a failure, or before first start.
+  const canResume = status === 'PAUSED' || status === 'FAILED' || status === 'INITIALIZED';
   return (
     <div className="flex flex-col gap-2 border border-zinc-800 bg-zinc-950/40 p-2.5">
       <div className="flex items-start justify-between gap-2">
@@ -67,7 +70,7 @@ function RunnerControls({
           <Button
             size="xs"
             variant="default"
-            disabled={isPaused || isTerminal || busy !== null}
+            disabled={!canPause || busy !== null}
             loading={busy === 'pause'}
             onClick={() => onAction('pause')}
             icon={<Pause className="h-3 w-3" aria-hidden />}
@@ -78,7 +81,7 @@ function RunnerControls({
           <Button
             size="xs"
             variant="primary"
-            disabled={(!isPaused && status !== 'UNKNOWN' && status !== 'INITIALIZED') || busy !== null}
+            disabled={!canResume || busy !== null}
             loading={busy === 'resume'}
             onClick={() => onAction('resume')}
             icon={<Play className="h-3 w-3" aria-hidden />}
@@ -105,8 +108,6 @@ export function RuntimeControlPanel({
 
   const [backfillBusy, setBackfillBusy] = useState<RunnerAction | null>(null);
   const [incrementalBusy, setIncrementalBusy] = useState<RunnerAction | null>(null);
-  // The telemetry contract does not expose the incremental runner state, so track the last command locally.
-  const [incrementalState, setIncrementalState] = useState<IncrementalLocalState>('UNKNOWN');
 
   const [dlqEntries, setDlqEntries] = useState<DLQEntry[]>([]);
   const [dlqLoading, setDlqLoading] = useState(false);
@@ -145,10 +146,8 @@ export function RuntimeControlPanel({
     setBusy(action);
     try {
       const response = runner === 'backfill' ? await api.controlBackfill(action) : await api.controlIncremental(action);
-      if (runner === 'incremental') {
-        setIncrementalState(response.status);
-      }
       log('ok', `${runner}.${action} → ${response.status}`);
+      // Badges are driven solely by telemetry; re-poll so the authoritative runner state lands immediately.
       await onTelemetryRefresh();
     } catch (err: unknown) {
       log('error', `${runner}.${action} failed: ${errorMessage(err)}`);
@@ -188,7 +187,8 @@ export function RuntimeControlPanel({
     }
   };
 
-  const backfillStatus = telemetry?.backfill_status ?? 'UNKNOWN';
+  const backfillStatus: RunnerStatus = telemetry?.backfill_status ?? 'UNKNOWN';
+  const incrementalStatus: RunnerStatus = telemetry?.incremental_status ?? 'UNKNOWN';
   const pendingCount = telemetry?.dlq_pending_count ?? dlqEntries.length;
   const controlsDisabled = !isConnected;
 
@@ -217,8 +217,8 @@ export function RuntimeControlPanel({
           <RunnerControls
             name="Incremental CDC"
             description="Watermark poller replicating new mutations. Pausing lets lag accumulate; resuming drains it from the saved watermark."
-            status={incrementalState}
-            tone={incrementalState === 'RUNNING' ? 'ok' : incrementalState === 'PAUSED' ? 'warn' : 'neutral'}
+            status={incrementalStatus}
+            tone={runnerTone(telemetry?.incremental_status)}
             detail={telemetry ? `lag ${fmtInt(telemetry.incremental_lag_records)} rows · ${fmtDuration(telemetry.incremental_lag_ms)}` : '—'}
             busy={incrementalBusy}
             onAction={(action) => void runControl('incremental', action)}

@@ -34,7 +34,10 @@ export type CoordinatorStatus = 'INITIALIZED' | 'RUNNING' | 'STOPPED';
 
 export interface PipelineTelemetry {
   status?: CoordinatorStatus;
-  backfill_status?: PipelineStatus;
+  /** Authoritative state of the historical backfill runner (from BackfillRunner.getMetrics()). */
+  backfill_status: PipelineStatus;
+  /** Authoritative state of the incremental CDC runner (from IncrementalRunner.getMetrics()). */
+  incremental_status: PipelineStatus;
   backfill_cursor: number;
   backfill_total_records: number;
   backfill_completion_pct: number;
