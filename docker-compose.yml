@@ -74,3 +74,60 @@ services:
       retries: 5
     networks:
       - optio-network
+
+  pipeline:
+    build:
+      context: .
+      dockerfile: apps/pipeline/Dockerfile
+    container_name: optio-pipeline
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgresql://optio:optio_secure_pass@postgres:5432/optio_replication
+      - ELASTICSEARCH_NODE=http://elasticsearch:9200
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - RABBITMQ_URL=amqp://optio:optio_secure_pass@rabbitmq:5672
+      - PIPELINE_PORT=3000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - optio-network
+
+  consumer:
+    build:
+      context: .
+      dockerfile: apps/consumer/Dockerfile
+    container_name: optio-consumer
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      - RABBITMQ_URL=amqp://optio:optio_secure_pass@rabbitmq:5672
+      - CONSUMER_PORT=3001
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - optio-network
+
+  ui:
+    build:
+      context: .
+      dockerfile: apps/ui/Dockerfile
+    container_name: optio-ui
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      - PIPELINE_UPSTREAM=http://pipeline:3000
+    depends_on:
+      pipeline:
+        condition: service_started
+    networks:
+      - optio-network

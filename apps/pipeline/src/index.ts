@@ -54,7 +54,7 @@ export async function bootstrap(): Promise<BootstrapResult> {
     process.env.DATABASE_URL ||
     'postgres://optio:optio_secure_pass@localhost:5432/optio_db';
   const elasticsearchUrl =
-    process.env.ELASTICSEARCH_URL || 'http://localhost:9200';
+    process.env.ELASTICSEARCH_NODE || process.env.ELASTICSEARCH_URL || 'http://localhost:9200';
   const rabbitmqUrl =
     process.env.RABBITMQ_URL ||
     'amqp://optio:optio_secure_pass@localhost:5672';
