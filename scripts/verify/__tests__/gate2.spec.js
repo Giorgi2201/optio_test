@@ -127,18 +127,23 @@ describe('Gate 2 Verification - Deduplication & Effectively-Once Delivery', () =
     );
   });
 
-  it('7. DLQ Offset: expected sink parity is sourceCount minus records the Elasticsearch sink rejected', async () => {
-    const mockQueryDatabase = async (sql) => {
-      if (sql.includes('dead_letter_queue')) {
-        return [{ es_rejected: 3 }];
-      }
-      return [{ total: '5000' }];
-    };
+  const dlqAwareQuery = async (sql) => {
+    if (sql.includes('dead_letter_queue')) {
+      return [{ record_id: 4998 }, { record_id: 4999 }, { record_id: 5000 }];
+    }
+    return [{ total: '5000' }];
+  };
 
+  it('7. DLQ Offset: expected sink parity is sourceCount minus quarantined records that are genuinely absent from the index', async () => {
+    let mgetIds = null;
     const result = await runGate2({
       ...fakeClock(),
-      queryDatabase: mockQueryDatabase,
+      queryDatabase: dlqAwareQuery,
       getElasticsearchCount: async () => 4997,
+      getElasticsearchDocs: async (ids) => {
+        mgetIds = ids;
+        return ids.map((id) => ({ id: String(id), found: false, source: null }));
+      },
       refreshElasticsearch: async () => true,
       getConsumerMetrics: async () => ({ uniqueProcessed: 4997, duplicatesPrevented: 0 }),
       getTelemetry: quiescentTelemetry,
@@ -148,12 +153,64 @@ describe('Gate 2 Verification - Deduplication & Effectively-Once Delivery', () =
     });
 
     assert.equal(result.passed, true);
+    assert.deepEqual(mgetIds, ['4998', '4999', '5000']);
     assert.equal(result.dlqCount, 3);
+    assert.equal(result.dlqMissingFromSink, 3);
     assert.equal(result.expectedSinkCount, 4997);
     assert.equal(
       result.output,
       'G2 no duplicates ................ PASS (5,000 source / 4,997 sink / 0 dupes)'
     );
+  });
+
+  it('10. Replayed poison pills: quarantined records already present in the index count as delivered, not as duplicates', async () => {
+    // Scenario: operator replayed the 3 poison pills through the DLQ (indexed, RESOLVED), then a
+    // re-processing pass re-quarantined the still-corrupt source rows as fresh PENDING entries.
+    const result = await runGate2({
+      ...fakeClock(),
+      queryDatabase: dlqAwareQuery,
+      getElasticsearchCount: async () => 5000,
+      getElasticsearchDocs: async (ids) => ids.map((id) => ({ id: String(id), found: true, source: { id, version: 1 } })),
+      refreshElasticsearch: async () => true,
+      getConsumerMetrics: async () => null,
+      getTelemetry: quiescentTelemetry,
+      maxWaitMs: 5000,
+      silent: true,
+      closeDb: false
+    });
+
+    assert.equal(result.passed, true);
+    assert.equal(result.dlqCount, 3);
+    assert.equal(result.dlqAlreadyIndexed, 3);
+    assert.equal(result.dlqMissingFromSink, 0);
+    assert.equal(result.expectedSinkCount, 5000);
+    assert.equal(result.duplicates, 0);
+    assert.equal(
+      result.output,
+      'G2 no duplicates ................ PASS (5,000 source / 5,000 sink / 0 dupes)'
+    );
+  });
+
+  it('11. Partially replayed quarantine: only the absent records are subtracted, and a real shortfall still fails', async () => {
+    const result = await runGate2({
+      ...fakeClock(),
+      queryDatabase: dlqAwareQuery,
+      // 1 of 3 quarantined records was replayed into the index -> expect 4998; index actually holds 4997
+      getElasticsearchCount: async () => 4997,
+      getElasticsearchDocs: async (ids) => ids.map((id, i) => ({ id: String(id), found: i === 0, source: null })),
+      refreshElasticsearch: async () => true,
+      getConsumerMetrics: async () => null,
+      getTelemetry: quiescentTelemetry,
+      maxWaitMs: 2000,
+      silent: true,
+      closeDb: false
+    });
+
+    assert.equal(result.passed, false);
+    assert.equal(result.expectedSinkCount, 4998);
+    assert.equal(result.duplicates, 0);
+    assert.match(result.output, /Elasticsearch parity failure \(4998 vs 4997\)/);
+    assert.doesNotMatch(result.output, /duplicates detected/);
   });
 
   it('8. Waits for late-arriving documents, then fails honestly on a persistent parity gap (no tolerance band)', async () => {
