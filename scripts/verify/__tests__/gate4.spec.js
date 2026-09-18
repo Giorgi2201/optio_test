@@ -94,18 +94,23 @@ describe('Gate 4 Verification - Partial Batch Failure & DLQ Quarantine', () => {
       }));
     };
 
-    const mockSleep = async () => {};
+    let fakeNow = 0;
 
     const result = await runGate4({
       queryDatabase: mockQueryDatabase,
       seedGate4Batch: mockSeedGate4Batch,
       getElasticsearchCount: mockGetElasticsearchCount,
       getDLQEntriesForRecords: mockGetDLQEntries,
-      sleep: mockSleep,
+      refreshElasticsearch: async () => true,
+      getTelemetry: async () => ({ backfill_status: 'COMPLETED', incremental_lag_records: 0 }),
+      sleep: async (ms) => {
+        fakeNow += ms;
+      },
+      now: () => fakeNow,
       batchTotal: 500,
       corruptedCount: 3,
-      simulatedWrittenCount: 497,
       maxWaitMs: 5000,
+      silent: true,
       closeDb: false
     });
 
@@ -113,11 +118,54 @@ describe('Gate 4 Verification - Partial Batch Failure & DLQ Quarantine', () => {
     assert.equal(result.writtenCount, 497);
     assert.equal(result.dlqCount, 3);
     assert.equal(result.contextSufficient, true);
+    assert.equal(result.quiesced, true);
     assert.equal(
       result.output,
       'G4 partial batch failure ........ PASS (497 written, 3 in DLQ)'
     );
     assert.equal(seedCalled, true);
     assert.equal(dlqQueried, true);
+  });
+
+  it('7. Measured Counts: written count comes from the real index delta, not from the runner options', async () => {
+    let esCalls = 0;
+    let fakeNow = 0;
+
+    const result = await runGate4({
+      queryDatabase: async () => [],
+      seedGate4Batch: async (total) => ({
+        insertedIds: Array.from({ length: total }, (_, i) => i + 1),
+        corruptedIds: [101, 202, 303]
+      }),
+      // Only 490 of 497 valid records ever land
+      getElasticsearchCount: async () => {
+        esCalls++;
+        return esCalls === 1 ? 5000 : 5490;
+      },
+      getDLQEntriesForRecords: async (ids) =>
+        ids.map((id) => ({
+          id,
+          record_id: id,
+          sink_target: 'ELASTICSEARCH',
+          payload: { balance: 'NaN' },
+          error_code: 'MAPPER_PARSING_EXCEPTION',
+          error_message: 'bad balance',
+          status: 'PENDING',
+          retry_count: 0
+        })),
+      refreshElasticsearch: async () => true,
+      getTelemetry: async () => ({ backfill_status: 'COMPLETED', incremental_lag_records: 0 }),
+      sleep: async (ms) => {
+        fakeNow += ms;
+      },
+      now: () => fakeNow,
+      maxWaitMs: 3000,
+      silent: true,
+      closeDb: false
+    });
+
+    assert.equal(result.passed, false);
+    assert.equal(result.writtenCount, 490);
+    assert.match(result.output, /490 written \(expected 497\)/);
   });
 });

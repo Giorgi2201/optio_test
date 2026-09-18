@@ -75,6 +75,23 @@ describe('Gate 2 Verification - Deduplication & Effectively-Once Delivery', () =
     assert.equal(result.duplicates, 0);
   });
 
+  function fakeClock() {
+    let fakeNow = 1_000_000;
+    return {
+      now: () => fakeNow,
+      sleep: async (ms) => {
+        fakeNow += ms;
+      }
+    };
+  }
+
+  const quiescentTelemetry = async () => ({
+    status: 'RUNNING',
+    backfill_status: 'COMPLETED',
+    backfill_cursor: 5000,
+    incremental_lag_records: 0
+  });
+
   it('6. End-to-End Runner Mock: Simulates full Gate 2 execution with mocked DB, Elasticsearch, and Consumer responses', async () => {
     const mockQueryDatabase = async () => [{ total: '5000' }];
     const mockGetElasticsearchCount = async () => 5000;
@@ -84,14 +101,16 @@ describe('Gate 2 Verification - Deduplication & Effectively-Once Delivery', () =
       duplicatesPrevented: 331,
       deadLettered: 0
     });
-    const mockSleep = async () => {};
 
     const result = await runGate2({
+      ...fakeClock(),
       queryDatabase: mockQueryDatabase,
       getElasticsearchCount: mockGetElasticsearchCount,
+      refreshElasticsearch: async () => true,
       getConsumerMetrics: mockGetConsumerMetrics,
-      sleep: mockSleep,
+      getTelemetry: quiescentTelemetry,
       maxWaitMs: 5000,
+      silent: true,
       closeDb: false
     });
 
@@ -101,9 +120,80 @@ describe('Gate 2 Verification - Deduplication & Effectively-Once Delivery', () =
     assert.equal(result.consumerUniqueCount, 5000);
     assert.equal(result.duplicates, 0);
     assert.equal(result.duplicatesPrevented, 331);
+    assert.equal(result.quiesced, true);
     assert.equal(
       result.output,
       'G2 no duplicates ................ PASS (5,000 source / 5,000 sink / 0 dupes)'
     );
+  });
+
+  it('7. DLQ Offset: expected sink parity is sourceCount minus records the Elasticsearch sink rejected', async () => {
+    const mockQueryDatabase = async (sql) => {
+      if (sql.includes('dead_letter_queue')) {
+        return [{ es_rejected: 3 }];
+      }
+      return [{ total: '5000' }];
+    };
+
+    const result = await runGate2({
+      ...fakeClock(),
+      queryDatabase: mockQueryDatabase,
+      getElasticsearchCount: async () => 4997,
+      refreshElasticsearch: async () => true,
+      getConsumerMetrics: async () => ({ uniqueProcessed: 4997, duplicatesPrevented: 0 }),
+      getTelemetry: quiescentTelemetry,
+      maxWaitMs: 5000,
+      silent: true,
+      closeDb: false
+    });
+
+    assert.equal(result.passed, true);
+    assert.equal(result.dlqCount, 3);
+    assert.equal(result.expectedSinkCount, 4997);
+    assert.equal(
+      result.output,
+      'G2 no duplicates ................ PASS (5,000 source / 4,997 sink / 0 dupes)'
+    );
+  });
+
+  it('8. Waits for late-arriving documents, then fails honestly on a persistent parity gap (no tolerance band)', async () => {
+    let esPolls = 0;
+    const result = await runGate2({
+      ...fakeClock(),
+      queryDatabase: async () => [{ total: '5000' }],
+      getElasticsearchCount: async () => {
+        esPolls++;
+        return 4990; // 10 documents never arrive
+      },
+      refreshElasticsearch: async () => true,
+      getConsumerMetrics: async () => null,
+      getTelemetry: quiescentTelemetry,
+      maxWaitMs: 3000,
+      silent: true,
+      closeDb: false
+    });
+
+    assert.equal(result.passed, false);
+    assert.equal(esPolls > 1, true, 'must keep polling Elasticsearch until the wait budget is exhausted');
+    assert.match(result.output, /FAIL/);
+    assert.match(result.output, /Elasticsearch parity failure \(5000 vs 4990\)/);
+  });
+
+  it('9. Duplicate Leak: an index count above parity is reported as duplicates and fails the gate', async () => {
+    const result = await runGate2({
+      ...fakeClock(),
+      queryDatabase: async () => [{ total: '5000' }],
+      getElasticsearchCount: async () => 5050,
+      refreshElasticsearch: async () => true,
+      getConsumerMetrics: async () => ({ uniqueProcessed: 5000, duplicatesPrevented: 12 }),
+      getTelemetry: quiescentTelemetry,
+      maxWaitMs: 2000,
+      silent: true,
+      closeDb: false
+    });
+
+    assert.equal(result.passed, false);
+    assert.equal(result.duplicates, 50);
+    assert.match(result.output, /50 duplicates detected in sink/);
   });
 });

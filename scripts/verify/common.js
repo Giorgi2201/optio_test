@@ -136,6 +136,161 @@ async function refreshElasticsearch(indexName = 'records_search_index', url, tim
 }
 
 /**
+ * Fetches specific documents by deterministic _id from Elasticsearch via _mget.
+ * Returns an array of { id, found, source } or null if the cluster is unreachable.
+ */
+async function getElasticsearchDocs(ids = [], indexName = 'records_search_index', url, timeoutMs = 5000) {
+  if (!ids || ids.length === 0) {
+    return [];
+  }
+  const baseUrl = process.env.ELASTICSEARCH_URL || process.env.ELASTICSEARCH_NODE || url || 'http://localhost:9200';
+  const targetUrl = `${baseUrl.replace(/\/+$/, '')}/${indexName}/_mget?_source=id,version`;
+  try {
+    const res = await fetch(targetUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: ids.map((id) => String(id)) }),
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    if (!res.ok) {
+      return null;
+    }
+    const data = await res.json();
+    if (!Array.isArray(data.docs)) {
+      return null;
+    }
+    return data.docs.map((d) => ({
+      id: d._id,
+      found: Boolean(d.found),
+      source: d._source || null
+    }));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Issues a runner control command (pause | resume) to the pipeline HTTP control API.
+ * Returns the parsed response or null if the daemon is unreachable / rejected the command.
+ */
+async function controlBackfill(action, url, timeoutMs = 5000) {
+  const base = url || process.env.PIPELINE_CONTROL_URL || 'http://localhost:3000/api/control';
+  const targetUrl = `${base.replace(/\/+$/, '')}/backfill/${action}`;
+  try {
+    const res = await fetch(targetUrl, { method: 'POST', signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) {
+      return null;
+    }
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reads the persisted backfill watermark row. Returns { lastProcessedId, status }.
+ */
+async function readBackfillCheckpoint(queryFn = queryDatabase) {
+  const rows = await queryFn(
+    "SELECT last_processed_id, status FROM replication_checkpoints WHERE pipeline_id = 'backfill_pipeline'"
+  );
+  return {
+    lastProcessedId: parseInt(rows[0]?.last_processed_id || '0', 10),
+    status: rows[0]?.status || 'UNKNOWN'
+  };
+}
+
+/**
+ * Waits until the pipeline is quiescent: historical backfill COMPLETED and zero incremental lag.
+ * Gates 2-4 depend on this so that their sink counts are not polluted by a background backfill
+ * or CDC storm still streaming records. Returns { quiesced, telemetry, elapsedMs, reason }.
+ */
+async function waitForPipelineQuiescence(options = {}) {
+  const telemetryFn = options.getTelemetry || getTelemetry;
+  const sleepFn = options.sleep || sleep;
+  const nowFn = options.now || Date.now;
+  const timeoutMs = options.timeoutMs !== undefined ? options.timeoutMs : 60000;
+  const pollMs = options.pollMs || 500;
+  const progressEveryMs = options.progressEveryMs || 5000;
+  const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+  const requireBackfillComplete = options.requireBackfillComplete !== false;
+  // Tolerate a daemon that is momentarily down (e.g. container restart between gates) before giving up.
+  const unreachableGraceMs = Math.min(
+    timeoutMs,
+    options.unreachableGraceMs !== undefined ? options.unreachableGraceMs : 15000
+  );
+
+  const start = nowFn();
+  let lastProgress = start;
+  let telemetry = null;
+  let unreachableSince = null;
+
+  while (true) {
+    try {
+      telemetry = await telemetryFn();
+    } catch {
+      telemetry = null;
+    }
+
+    if (telemetry) {
+      unreachableSince = null;
+      const backfillDone = !requireBackfillComplete || telemetry.backfill_status === 'COMPLETED';
+      const lagDrained = typeof telemetry.incremental_lag_records !== 'number' || telemetry.incremental_lag_records === 0;
+      if (backfillDone && lagDrained) {
+        return { quiesced: true, telemetry, elapsedMs: nowFn() - start, reason: null };
+      }
+    } else {
+      if (unreachableSince === null) {
+        unreachableSince = nowFn();
+      }
+      if (nowFn() - unreachableSince >= unreachableGraceMs) {
+        return { quiesced: false, telemetry: null, elapsedMs: nowFn() - start, reason: 'telemetry unreachable' };
+      }
+    }
+
+    const elapsed = nowFn() - start;
+    if (elapsed >= timeoutMs) {
+      const reason = telemetry
+        ? `backfill_status=${telemetry.backfill_status ?? 'n/a'}, incremental_lag_records=${telemetry.incremental_lag_records ?? 'n/a'} after ${Math.round(elapsed / 1000)}s`
+        : 'telemetry unreachable';
+      return { quiesced: false, telemetry, elapsedMs: elapsed, reason };
+    }
+
+    if (onProgress && telemetry && nowFn() - lastProgress >= progressEveryMs) {
+      lastProgress = nowFn();
+      onProgress(telemetry, elapsed);
+    }
+
+    await sleepFn(pollMs);
+  }
+}
+
+/**
+ * Applies a bounded mutation burst to existing (non-corrupted) source rows so the CDC runner has
+ * real work to replicate. Returns [{ id, version }] with the post-mutation versions.
+ */
+async function mutateSourceRecords(count = 200, queryFn = queryDatabase) {
+  const rows = await queryFn(
+    `
+    WITH candidates AS (
+      SELECT id FROM source_records
+      WHERE is_corrupted = FALSE
+      ORDER BY id DESC
+      LIMIT $1
+    )
+    UPDATE source_records s
+    SET version = s.version + 1,
+        updated_at = NOW()
+    FROM candidates c
+    WHERE s.id = c.id
+    RETURNING s.id, s.version;
+    `,
+    [count]
+  );
+  return rows.map((r) => ({ id: parseInt(r.id, 10), version: parseInt(r.version, 10) }));
+}
+
+/**
  * Queries the independent consumer microservice metrics endpoint.
  * Returns null if unreachable or on error/timeout.
  */
@@ -432,14 +587,16 @@ async function startReceiver(sinkName = 'elasticsearch') {
  * 1. downtimeSec > 0 (receiver was genuinely down for a non-trivial duration)
  * 2. lostRecords === 0 (no records dropped or lost during receiver blackout)
  * 3. recoveryTimeSec >= 0 (pipeline resumed and achieved parity post-restoration)
+ * 4. antiBusyLoopVerified (circuit breaker was observed OPEN / throttling during the blackout)
  */
-function evaluateGate3Outage(downtimeSec, lostRecords = 0, recoveryTimeSec = 0) {
+function evaluateGate3Outage(downtimeSec, lostRecords = 0, recoveryTimeSec = 0, antiBusyLoopVerified = true) {
   const downtimeValid = downtimeSec > 0;
   const zeroLost = lostRecords === 0;
   const numRecTime = typeof recoveryTimeSec === 'number' ? recoveryTimeSec : parseFloat(recoveryTimeSec);
   const recoveryValid = !isNaN(numRecTime) && numRecTime >= 0;
+  const breakerValid = antiBusyLoopVerified === true;
 
-  const passed = downtimeValid && zeroLost && recoveryValid;
+  const passed = downtimeValid && zeroLost && recoveryValid && breakerValid;
 
   let details;
   if (passed) {
@@ -452,6 +609,7 @@ function evaluateGate3Outage(downtimeSec, lostRecords = 0, recoveryTimeSec = 0) 
     if (!downtimeValid) reasons.push(`zero downtime simulated (${downtimeSec}s)`);
     if (!zeroLost) reasons.push(`${lostRecords} records lost during outage`);
     if (!recoveryValid) reasons.push(`recovery timed out or failed`);
+    if (!breakerValid) reasons.push('circuit breaker never opened (no throttling observed)');
     details = reasons.join(', ');
   }
 
@@ -462,6 +620,7 @@ function evaluateGate3Outage(downtimeSec, lostRecords = 0, recoveryTimeSec = 0) 
     downtimeSec,
     lostRecords,
     recoveryTimeSec,
+    antiBusyLoopVerified: breakerValid,
     formattedTime: `${downtimeSec}s`,
     details,
     output
@@ -709,8 +868,13 @@ module.exports = {
   closeDatabase,
   getTelemetry,
   getElasticsearchCount,
+  getElasticsearchDocs,
   refreshElasticsearch,
   getConsumerMetrics,
+  controlBackfill,
+  readBackfillCheckpoint,
+  waitForPipelineQuiescence,
+  mutateSourceRecords,
   isDockerRunning,
   doesDockerContainerExist,
   startPipelineProcess,

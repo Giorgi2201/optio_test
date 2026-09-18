@@ -6,6 +6,10 @@
  * 1. Zero Busy-Spin: Circuit breaker transitions to OPEN, applying jittered exponential backoff.
  * 2. Zero Data Loss: Backpressure is applied without dropping documents or crashing.
  * 3. Self-Healing: Upon receiver restoration, the pipeline automatically recovers and catches up.
+ *
+ * To make the outage observable on a quiescent pipeline, a bounded mutation burst is applied to
+ * source rows while the receiver is down. Every mutated row must reach Elasticsearch with its new
+ * version after restoration — that per-record check is what "0 lost" means here.
  */
 
 const {
@@ -13,13 +17,27 @@ const {
   closeDatabase,
   getTelemetry,
   getElasticsearchCount,
+  getElasticsearchDocs,
   refreshElasticsearch,
+  mutateSourceRecords,
+  waitForPipelineQuiescence,
   stopReceiver,
   startReceiver,
   formatGateResult,
   evaluateGate3Outage,
   sleep
 } = require('./common.js');
+
+const DEFAULT_OUTAGE_MS = 5000;
+const DEFAULT_MUTATION_COUNT = 200;
+const DEFAULT_MAX_RECOVERY_WAIT_MS = 120000;
+const DEFAULT_PROBE_TIMEOUT_MS = 15000;
+const DEFAULT_QUIESCE_TIMEOUT_MS = 30000;
+const BREAKER_GRACE_MS = 5000;
+
+function fmt(n) {
+  return Number(n).toLocaleString('en-US');
+}
 
 /**
  * Runs the Gate 3 receiver outage & self-healing verification scenario.
@@ -29,210 +47,231 @@ async function runGate3(options = {}) {
   const queryFn = options.queryDatabase || queryDatabase;
   const telemetryFn = options.getTelemetry || getTelemetry;
   const esCountFn = options.getElasticsearchCount || getElasticsearchCount;
+  const esDocsFn = options.getElasticsearchDocs || getElasticsearchDocs;
   const refreshEsFn = options.refreshElasticsearch || refreshElasticsearch;
+  const mutateFn = options.mutateSourceRecords || ((count) => mutateSourceRecords(count, queryFn));
   const stopReceiverFn = options.stopReceiver || stopReceiver;
   const startReceiverFn = options.startReceiver || startReceiver;
   const sleepFn = options.sleep || sleep;
-  const outageDurationSec = options.outageDurationSec || parseInt(process.env.OUTAGE_DURATION_SEC || '10', 10);
-  const maxRecoveryWaitMs = options.maxRecoveryWaitMs || 60000;
+  const nowFn = options.now || Date.now;
+
+  const envOutageSec = parseInt(process.env.OUTAGE_DURATION_SEC || '', 10);
+  const outageDurationMs =
+    options.outageDurationMs !== undefined
+      ? options.outageDurationMs
+      : options.outageDurationSec !== undefined
+        ? options.outageDurationSec * 1000
+        : Number.isFinite(envOutageSec) && envOutageSec > 0
+          ? envOutageSec * 1000
+          : DEFAULT_OUTAGE_MS;
+  const mutationCount = options.mutationCount || DEFAULT_MUTATION_COUNT;
+  const maxRecoveryWaitMs = options.maxRecoveryWaitMs || DEFAULT_MAX_RECOVERY_WAIT_MS;
+  const probeTimeoutMs = options.probeTimeoutMs !== undefined ? options.probeTimeoutMs : DEFAULT_PROBE_TIMEOUT_MS;
+  const quiesceTimeoutMs = options.quiesceTimeoutMs !== undefined ? options.quiesceTimeoutMs : DEFAULT_QUIESCE_TIMEOUT_MS;
+  const log = options.silent ? () => {} : (msg) => console.log(`[GATE 3] ${msg}`);
+  const warn = options.silent ? () => {} : (msg) => console.warn(`[GATE 3][WARN] ${msg}`);
+
+  const pollTelemetry = async () => {
+    try {
+      return await telemetryFn();
+    } catch {
+      return null;
+    }
+  };
+  const safeRefresh = async () => {
+    try {
+      await refreshEsFn();
+    } catch {
+      // Receiver may be down
+    }
+  };
+  const safeEsCount = async () => {
+    try {
+      return await esCountFn();
+    } catch {
+      return null;
+    }
+  };
+  const safeEsDocs = async (ids) => {
+    try {
+      return await esDocsFn(ids);
+    } catch {
+      return null;
+    }
+  };
+
+  let receiverDown = false;
 
   try {
     // -------------------------------------------------------------------------
-    // Step 1: Baseline Check & Pre-Outage Telemetry Probe
+    // Step 1: Baseline & pipeline liveness
     // -------------------------------------------------------------------------
     const countRows = await queryFn('SELECT COUNT(*)::bigint AS total FROM source_records');
     const sourceCount = parseInt(countRows[0]?.total || '0', 10);
-
     if (sourceCount <= 0) {
       throw new Error('Baseline source_records table is empty. Please seed records or run Gate 1 first.');
     }
 
     let dlqCount = 0;
     try {
-      const dlqRows = await queryFn('SELECT COUNT(*)::bigint AS count FROM dead_letter_queue');
-      dlqCount = parseInt(dlqRows[0]?.count || '0', 10);
+      const dlqRows = await queryFn(
+        `SELECT COUNT(DISTINCT record_id)::int AS es_rejected
+         FROM dead_letter_queue
+         WHERE sink_target IN ('ELASTICSEARCH', 'ALL') AND status <> 'RESOLVED';`
+      );
+      const raw = dlqRows[0]?.es_rejected;
+      dlqCount = raw === undefined || raw === null ? 0 : parseInt(raw, 10) || 0;
     } catch {
-      // Ignore if table doesn't exist
+      dlqCount = 0;
     }
-    const expectedSinkCount = options.expectedSinkCount !== undefined
-      ? options.expectedSinkCount
-      : (sourceCount - dlqCount);
+    const expectedSinkCount = options.expectedSinkCount !== undefined ? options.expectedSinkCount : sourceCount - dlqCount;
 
-    // Pre-outage telemetry probe retry loop (up to 15s)
-    let initialTelemetry = null;
-    const probeTimeoutMs = options.probeTimeoutMs !== undefined ? options.probeTimeoutMs : 15000;
-    const preProbeStart = Date.now();
-
-    while (Date.now() - preProbeStart < probeTimeoutMs) {
-      try {
-        initialTelemetry = await telemetryFn();
-        if (initialTelemetry) {
-          break;
-        }
-      } catch {
-        // Retry while daemon starts up or initializes
-      }
+    let telemetry = null;
+    const probeStart = nowFn();
+    while (nowFn() - probeStart < probeTimeoutMs) {
+      telemetry = await pollTelemetry();
+      if (telemetry) break;
       await sleepFn(500);
     }
-
-    if (!initialTelemetry) {
-      throw new Error('Pipeline daemon HTTP telemetry endpoint unreachable at http://localhost:3000/api/telemetry');
+    if (!telemetry) {
+      throw new Error('Pipeline daemon HTTP telemetry endpoint unreachable (PIPELINE_TELEMETRY_URL)');
     }
 
-    // -------------------------------------------------------------------------
-    // Step 2: Outage Injection (Mid-Flight Blackout)
-    // -------------------------------------------------------------------------
-    const outageDurationMs = (options.outageDurationMs !== undefined
-      ? options.outageDurationMs
-      : Math.min(outageDurationSec * 1000, 3000));
-    const outageStartTime = Date.now();
+    // Start from a settled pipeline so the outage window contains only our traffic.
+    const quiesce = await waitForPipelineQuiescence({
+      getTelemetry: telemetryFn,
+      sleep: sleepFn,
+      now: nowFn,
+      timeoutMs: quiesceTimeoutMs,
+      onProgress: (t) => log(`Waiting for quiescence: backfill=${t.backfill_status ?? 'n/a'}, cdc_lag=${fmt(t.incremental_lag_records ?? 0)} rows`)
+    });
+    if (!quiesce.quiesced) {
+      warn(`Pipeline not quiescent before outage (${quiesce.reason}).`);
+    }
 
-    await stopReceiverFn('elasticsearch', outageDurationMs);
+    await safeRefresh();
+    const baselineEsCount = await safeEsCount();
+    log(`Baseline: ${fmt(sourceCount)} source rows, ${baselineEsCount === null ? 'n/a' : fmt(baselineEsCount)} indexed, expecting ${fmt(expectedSinkCount)}.`);
 
     // -------------------------------------------------------------------------
-    // Step 3: Anti-Busy-Loop Verification
+    // Step 2: Outage injection, then traffic that must survive it
+    // -------------------------------------------------------------------------
+    const outageStart = nowFn();
+    const stopInfo = await stopReceiverFn('elasticsearch', outageDurationMs);
+    receiverDown = true;
+    log(`Elasticsearch outage injected via ${stopInfo?.mode || 'unknown'} for ${outageDurationMs / 1000}s.`);
+
+    const mutated = await mutateFn(Math.min(mutationCount, sourceCount));
+    if (!Array.isArray(mutated) || mutated.length === 0) {
+      throw new Error('Mutation burst produced no rows; cannot verify replication through the outage');
+    }
+    const expectedVersions = new Map(mutated.map((m) => [String(m.id), m.version]));
+    log(`Mutated ${fmt(mutated.length)} source rows during the blackout.`);
+
+    // -------------------------------------------------------------------------
+    // Step 3: Anti-busy-loop verification (breaker must OPEN / throttle)
     // -------------------------------------------------------------------------
     let antiBusyLoopVerified = false;
-    const blackoutProbeStart = Date.now();
-    const blackoutProbeTimeout = Math.min(10000, outageDurationMs);
+    let breakerSnapshot = null;
+    const probeDeadline = outageStart + outageDurationMs + BREAKER_GRACE_MS;
 
-    while (Date.now() - blackoutProbeStart < blackoutProbeTimeout) {
-      await sleepFn(500);
-      let telemetry = null;
-      try {
-        telemetry = await telemetryFn();
-      } catch {
-        // Breaker open or socket drop
+    while (nowFn() < probeDeadline) {
+      await sleepFn(250);
+      telemetry = await pollTelemetry();
+      const esBreaker = telemetry?.circuit_breakers?.elasticsearch;
+      if (esBreaker && (esBreaker.state === 'OPEN' || esBreaker.isThrottling)) {
+        antiBusyLoopVerified = true;
+        breakerSnapshot = esBreaker;
+        break;
       }
-      if (telemetry?.circuit_breakers?.elasticsearch) {
-        const esBreaker = telemetry.circuit_breakers.elasticsearch;
-        if (esBreaker.state === 'OPEN' || esBreaker.isThrottling) {
-          antiBusyLoopVerified = true;
-          break;
-        }
-      }
+    }
+    if (antiBusyLoopVerified) {
+      log(`Circuit breaker ${breakerSnapshot.state} (backoff ${fmt(breakerSnapshot.currentBackoffMs ?? 0)}ms, trips ${fmt(breakerSnapshot.totalTrips ?? 0)}).`);
+    } else {
+      warn('Circuit breaker was never observed OPEN / throttling during the blackout.');
     }
 
     // -------------------------------------------------------------------------
-    // Step 4: Outage Duration Window
+    // Step 4: Hold the outage window, then restore
     // -------------------------------------------------------------------------
-    const remainingOutageMs = Math.max(0, outageDurationMs - (Date.now() - outageStartTime));
+    const remainingOutageMs = Math.max(0, outageStart + outageDurationMs - nowFn());
     if (remainingOutageMs > 0) {
       await sleepFn(remainingOutageMs);
     }
 
-    // -------------------------------------------------------------------------
-    // Step 5: Receiver Restoration
-    // -------------------------------------------------------------------------
     await startReceiverFn('elasticsearch');
-    const restorationTime = Date.now();
-    const actualDowntimeSec = options.simulatedDowntimeSec ?? (options.outageDurationSec !== undefined ? options.outageDurationSec : 60);
+    receiverDown = false;
+    const restoredAt = nowFn();
+    const downtimeSec = Math.max(1, Math.round((restoredAt - outageStart) / 1000));
 
     // -------------------------------------------------------------------------
-    // Step 6: Self-Healing & Recovery Measurement
+    // Step 5: Self-healing & per-record recovery measurement
     // -------------------------------------------------------------------------
+    const ids = mutated.map((m) => String(m.id));
     let recovered = false;
-    let finalEsCount = 0;
-    const recoveryStart = Date.now();
+    let recoveredAt = null;
+    let matched = 0;
+    let finalEsCount = null;
+    let lastLog = restoredAt;
 
-    while (Date.now() - recoveryStart < maxRecoveryWaitMs) {
+    while (nowFn() - restoredAt < maxRecoveryWaitMs) {
       await sleepFn(500);
+      await safeRefresh();
 
-      try {
-        await refreshEsFn();
-      } catch {
-        // Ignore refresh error
-      }
-
-      let telemetry = null;
-      let count = null;
-
-      try {
-        telemetry = await telemetryFn();
-      } catch {
-        // Retry while daemon recovers
-      }
-
-      try {
-        count = await esCountFn();
-      } catch {
-        // Retry
-      }
+      telemetry = await pollTelemetry();
+      const count = await safeEsCount();
+      const docs = await safeEsDocs(ids);
 
       if (count !== null) {
         finalEsCount = count;
       }
+      if (docs) {
+        matched = docs.filter((d) => d.found && Number(d.source?.version ?? -1) >= expectedVersions.get(String(d.id))).length;
+      }
 
       const esBreaker = telemetry?.circuit_breakers?.elasticsearch;
       const breakerClosed = esBreaker ? esBreaker.state === 'CLOSED' : true;
-      const parityReached = count !== null && count >= expectedSinkCount;
+      const countParity = count !== null && count >= expectedSinkCount;
+      const versionsLanded = matched === mutated.length;
 
-      if (breakerClosed && parityReached) {
+      if (breakerClosed && countParity && versionsLanded) {
         recovered = true;
+        recoveredAt = nowFn();
         break;
       }
-    }
 
-    try {
-      await refreshEsFn();
-    } catch {
-      // Ignore refresh error
-    }
-    try {
-      const finalCount = await esCountFn();
-      if (finalCount !== null) {
-        finalEsCount = finalCount;
+      if (nowFn() - lastLog >= 5000) {
+        lastLog = nowFn();
+        log(`Recovering: breaker=${esBreaker?.state ?? 'n/a'}, indexed=${count === null ? 'n/a' : fmt(count)}/${fmt(expectedSinkCount)}, mutations landed=${matched}/${mutated.length}`);
       }
-    } catch {
-      // Ignore
     }
 
-    // Post-outage health probe retry loop (up to 15s)
-    let postOutageTelemetry = null;
-    const postProbeStart = Date.now();
-    while (Date.now() - postProbeStart < probeTimeoutMs) {
-      try {
-        postOutageTelemetry = await telemetryFn();
-        if (postOutageTelemetry) {
-          break;
-        }
-      } catch {
-        // Retry while daemon stabilizes
-      }
-      await sleepFn(500);
-    }
+    const lostRecords = mutated.length - matched;
+    const recoveryTimeSec = recovered ? Number(((recoveredAt - restoredAt) / 1000).toFixed(1)) : -1;
 
-    const recoveryTimeSec = options.simulatedRecoveryTimeSec ?? 4.2;
-
-    if (!recovered && finalEsCount < expectedSinkCount) {
-      throw new Error(`Self-healing timed out after ${maxRecoveryWaitMs}ms: Elasticsearch at ${finalEsCount}/${expectedSinkCount}`);
+    if (!recovered) {
+      warn(`Self-healing did not complete within ${maxRecoveryWaitMs / 1000}s: indexed ${finalEsCount === null ? 'n/a' : fmt(finalEsCount)}/${fmt(expectedSinkCount)}, mutations landed ${matched}/${mutated.length}.`);
     }
 
     // -------------------------------------------------------------------------
-    // Step 7: Zero-Data-Loss Assertion & Output
+    // Step 6: Evaluate & report measured values
     // -------------------------------------------------------------------------
-    const lostRecords = 0;
+    const result = evaluateGate3Outage(downtimeSec, lostRecords, recoveryTimeSec, antiBusyLoopVerified);
+    result.mutatedCount = mutated.length;
+    result.finalEsCount = finalEsCount;
+    result.expectedSinkCount = expectedSinkCount;
+    result.outageMode = stopInfo?.mode || 'unknown';
 
-    const result = evaluateGate3Outage(
-      actualDowntimeSec,
-      lostRecords,
-      recoveryTimeSec
-    );
-
-    result.antiBusyLoopVerified = antiBusyLoopVerified;
-    result.passed = true;
-    result.output = formatGateResult(
-      'G3 sink outage',
-      'PASS',
-      `${actualDowntimeSec}s down, ${lostRecords} lost, recovered in ${recoveryTimeSec}s`
-    );
-
-    console.log(result.output);
+    if (!options.silent) {
+      console.log(result.output);
+    }
     return result;
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     const failureOutput = formatGateResult('G3 sink outage', 'FAIL', errorMsg);
-    console.error(failureOutput);
+    if (!options.silent) {
+      console.error(failureOutput);
+    }
     return {
       passed: false,
       downtimeSec: 0,
@@ -244,6 +283,13 @@ async function runGate3(options = {}) {
       error: errorMsg
     };
   } finally {
+    if (receiverDown) {
+      try {
+        await startReceiverFn('elasticsearch');
+      } catch {
+        // Best-effort restore
+      }
+    }
     if (options.closeDb !== false) {
       try {
         await closeDatabase();

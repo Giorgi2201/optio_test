@@ -70,82 +70,128 @@ describe('Gate 3 Verification - Receiver Outage, Anti-Busy-Loop & Self-Healing',
     assert.equal(esBreaker.isThrottling, true);
   });
 
-  it('6. End-to-End Runner Mock: Simulates full Gate 3 execution lifecycle with mocked receiver stop/start, telemetry polling, and recovery timing', async () => {
-    let receiverStopped = false;
-    let receiverRestored = false;
-    let pollCount = 0;
+  it('6. Invariant Rejection (Busy-Loop): Asserts failure when the circuit breaker was never observed OPEN / throttling', () => {
+    const result = evaluateGate3Outage(60, 0, 4.2, false);
 
-    const mockQueryDatabase = async () => [{ total: '5000' }];
+    assert.equal(result.passed, false);
+    assert.equal(result.antiBusyLoopVerified, false);
+    assert.match(result.output, /FAIL/);
+    assert.match(result.output, /circuit breaker never opened/);
+  });
 
-    const mockStopReceiver = async () => {
-      receiverStopped = true;
-      return { mode: 'mock', action: 'stopped' };
-    };
+  /**
+   * Fake receiver + pipeline for orchestration tests. Time is virtual: sleep() advances the clock,
+   * so measured downtime / recovery are deterministic.
+   */
+  function createOutageFixture({ breakerOpens = true, dropOne = false } = {}) {
+    const state = { receiverDown: false, mutated: [] };
+    let fakeNow = 5_000_000;
 
-    const mockStartReceiver = async () => {
-      receiverRestored = true;
-      return { mode: 'mock', action: 'started' };
-    };
-
-    const mockGetTelemetry = async () => {
-      pollCount++;
-      if (receiverStopped && !receiverRestored) {
-        // Outage window: circuit breaker is OPEN and throttling
-        return {
-          status: 'RUNNING',
-          circuit_breakers: {
-            elasticsearch: {
-              state: 'OPEN',
-              isThrottling: true,
-              currentBackoffMs: 2000
-            }
-          }
-        };
-      }
-      // Recovered state: circuit breaker is CLOSED
-      return {
+    return {
+      state,
+      now: () => fakeNow,
+      sleep: async (ms) => {
+        fakeNow += ms;
+      },
+      queryDatabase: async (sql) => (sql.includes('dead_letter_queue') ? [{ es_rejected: 0 }] : [{ total: '5000' }]),
+      refreshElasticsearch: async () => !state.receiverDown,
+      stopReceiver: async () => {
+        state.receiverDown = true;
+        return { mode: 'mock', action: 'stopped' };
+      },
+      startReceiver: async () => {
+        state.receiverDown = false;
+        return { mode: 'mock', action: 'started' };
+      },
+      mutateSourceRecords: async (count) => {
+        state.mutated = Array.from({ length: count }, (_, i) => ({ id: 5000 - i, version: 2 }));
+        return state.mutated;
+      },
+      getTelemetry: async () => ({
         status: 'RUNNING',
+        backfill_status: 'COMPLETED',
+        incremental_lag_records: state.receiverDown ? state.mutated.length : 0,
         circuit_breakers: {
-          elasticsearch: {
-            state: 'CLOSED',
-            isThrottling: false,
-            currentBackoffMs: 0
-          }
+          elasticsearch:
+            state.receiverDown && breakerOpens
+              ? { state: 'OPEN', isThrottling: true, currentBackoffMs: 2000, totalTrips: 1 }
+              : { state: 'CLOSED', isThrottling: false, currentBackoffMs: 0, totalTrips: breakerOpens ? 1 : 0 }
         }
-      };
+      }),
+      getElasticsearchCount: async () => (state.receiverDown ? null : 5000),
+      getElasticsearchDocs: async (ids) => {
+        if (state.receiverDown) return null;
+        return ids.map((id, i) => ({
+          id: String(id),
+          found: true,
+          // Optionally leave one mutation permanently unreplicated to simulate loss
+          source: { id: String(id), version: dropOne && i === 0 ? 1 : 2 }
+        }));
+      }
     };
+  }
 
-    const mockGetElasticsearchCount = async () => {
-      // During outage: partial count; after restoration: full count
-      return receiverRestored ? 5000 : 3500;
-    };
-
-    const mockSleep = async () => {};
+  it('7. End-to-End Runner Mock: outage -> mutation burst -> breaker OPEN -> restore -> every mutation lands, with measured downtime and recovery', async () => {
+    const fixture = createOutageFixture();
 
     const result = await runGate3({
-      queryDatabase: mockQueryDatabase,
-      getTelemetry: mockGetTelemetry,
-      getElasticsearchCount: mockGetElasticsearchCount,
-      stopReceiver: mockStopReceiver,
-      startReceiver: mockStartReceiver,
-      sleep: mockSleep,
-      outageDurationSec: 60,
-      simulatedDowntimeSec: 60,
-      simulatedRecoveryTimeSec: 4.2,
-      maxRecoveryWaitMs: 5000,
+      ...fixture,
+      outageDurationMs: 60000,
+      mutationCount: 200,
+      maxRecoveryWaitMs: 10000,
+      quiesceTimeoutMs: 1000,
+      silent: true,
       closeDb: false
     });
 
     assert.equal(result.passed, true);
     assert.equal(result.downtimeSec, 60);
     assert.equal(result.lostRecords, 0);
-    assert.equal(result.recoveryTimeSec, 4.2);
+    assert.equal(result.mutatedCount, 200);
     assert.equal(result.antiBusyLoopVerified, true);
+    assert.equal(result.recoveryTimeSec, 0.5);
+    assert.equal(fixture.state.receiverDown, false);
     assert.equal(
       result.output,
-      'G3 sink outage .................. PASS (60s down, 0 lost, recovered in 4.2s)'
+      'G3 sink outage .................. PASS (60s down, 0 lost, recovered in 0.5s)'
     );
-    assert.equal(receiverStopped, true);
-    assert.equal(receiverRestored, true);
+  });
+
+  it('8. Invariant Rejection: fails when the breaker never opens during the blackout (busy-spin risk)', async () => {
+    const fixture = createOutageFixture({ breakerOpens: false });
+
+    const result = await runGate3({
+      ...fixture,
+      outageDurationMs: 5000,
+      maxRecoveryWaitMs: 10000,
+      quiesceTimeoutMs: 1000,
+      silent: true,
+      closeDb: false
+    });
+
+    assert.equal(result.passed, false);
+    assert.equal(result.antiBusyLoopVerified, false);
+    assert.equal(result.lostRecords, 0);
+    assert.match(result.output, /circuit breaker never opened/);
+  });
+
+  it('9. Invariant Rejection: a mutation that never reaches Elasticsearch after restoration is counted as lost', async () => {
+    const fixture = createOutageFixture({ dropOne: true });
+
+    const result = await runGate3({
+      ...fixture,
+      outageDurationMs: 5000,
+      mutationCount: 50,
+      maxRecoveryWaitMs: 3000,
+      quiesceTimeoutMs: 1000,
+      silent: true,
+      closeDb: false
+    });
+
+    assert.equal(result.passed, false);
+    assert.equal(result.lostRecords, 1);
+    assert.match(result.output, /1 records lost during outage/);
+    // Receiver is always restored, even on failure
+    assert.equal(fixture.state.receiverDown, false);
   });
 });

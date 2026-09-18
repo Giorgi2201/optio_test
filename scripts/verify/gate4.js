@@ -16,10 +16,14 @@ const {
   refreshElasticsearch,
   seedGate4Batch,
   getDLQEntriesForRecords,
+  waitForPipelineQuiescence,
   formatGateResult,
   evaluateGate4PartialFailure,
   sleep
 } = require('./common.js');
+
+const DEFAULT_MAX_WAIT_MS = 30000;
+const DEFAULT_QUIESCE_TIMEOUT_MS = 30000;
 
 /**
  * Runs the Gate 4 partial batch failure & DLQ isolation verification scenario.
@@ -33,17 +37,41 @@ async function runGate4(options = {}) {
   const seedFn = options.seedGate4Batch || seedGate4Batch;
   const getDlqFn = options.getDLQEntriesForRecords || getDLQEntriesForRecords;
   const sleepFn = options.sleep || sleep;
-  const maxWaitMs = options.maxWaitMs !== undefined ? options.maxWaitMs : 15000;
+  const nowFn = options.now || Date.now;
+  const maxWaitMs = options.maxWaitMs !== undefined ? options.maxWaitMs : DEFAULT_MAX_WAIT_MS;
+  const quiesceTimeoutMs = options.quiesceTimeoutMs !== undefined ? options.quiesceTimeoutMs : DEFAULT_QUIESCE_TIMEOUT_MS;
+  const log = options.silent ? () => {} : (msg) => console.log(`[GATE 4] ${msg}`);
+  const warn = options.silent ? () => {} : (msg) => console.warn(`[GATE 4][WARN] ${msg}`);
+
+  const safeRefresh = async () => {
+    try {
+      await refreshEsFn();
+    } catch {
+      // Ignore refresh error
+    }
+  };
 
   try {
     // -------------------------------------------------------------------------
-    // Step 1: DLQ & State Baseline
+    // Step 1: Isolate test state — settle the pipeline, clear the DLQ, snapshot the index
     // -------------------------------------------------------------------------
+    // The 497/3 assertion is only exact if no other traffic (background backfill or CDC backlog)
+    // is landing in the sink while the batch is processed.
+    const quiesce = await waitForPipelineQuiescence({
+      getTelemetry: telemetryFn,
+      sleep: sleepFn,
+      now: nowFn,
+      timeoutMs: quiesceTimeoutMs,
+      onProgress: (t) => log(`Waiting for quiescence: backfill=${t.backfill_status ?? 'n/a'}, cdc_lag=${t.incremental_lag_records ?? 0} rows`)
+    });
+    if (!quiesce.quiesced) {
+      warn(`Pipeline not quiescent before injection (${quiesce.reason}); sink deltas may include unrelated traffic.`);
+    }
+
     // Clear old DLQ rows at start of test to isolate test state and prevent accumulation
     await queryFn('DELETE FROM dead_letter_queue;');
-    const initialDlqRows = await queryFn('SELECT COUNT(*)::bigint AS count FROM dead_letter_queue');
-    const initialDlqCount = parseInt(initialDlqRows[0]?.count || '0', 10);
 
+    await safeRefresh();
     const initialEsCount = (await esCountFn()) || 0;
 
     // -------------------------------------------------------------------------
@@ -61,45 +89,47 @@ async function runGate4(options = {}) {
       );
     }
 
+    log(`Injected ${batchTotal} records (${expectedWritten} valid, ${corruptedTarget} poison) on top of ${initialEsCount.toLocaleString('en-US')} indexed documents.`);
+
     // -------------------------------------------------------------------------
-    // Step 3: Pipeline Ingestion Execution
+    // Step 3: Pipeline Ingestion Execution — poll until exactly 497 landed and 3 quarantined
     // -------------------------------------------------------------------------
-    const startWait = Date.now();
+    const startWait = nowFn();
     let currentEsCount = initialEsCount;
     let dlqEntries = [];
+    let lastLog = startWait;
 
-    while (Date.now() - startWait < maxWaitMs) {
+    const uniqueDlqRecords = (rows) => new Set((rows || []).map((r) => r.record_id || r.id)).size;
+
+    while (nowFn() - startWait < maxWaitMs) {
       await sleepFn(500);
-
-      try {
-        await refreshEsFn();
-      } catch {
-        // Ignore refresh error
-      }
+      await safeRefresh();
 
       const [count, entries] = await Promise.all([
-        esCountFn(),
-        getDlqFn(corruptedIds)
+        esCountFn().catch(() => null),
+        getDlqFn(corruptedIds).catch(() => dlqEntries)
       ]);
 
       if (count !== null) {
         currentEsCount = count;
       }
-      dlqEntries = entries;
+      dlqEntries = entries || [];
 
       const writtenToEs = currentEsCount - initialEsCount;
-      if (writtenToEs >= expectedWritten && dlqEntries.length >= corruptedTarget) {
+      const quarantined = uniqueDlqRecords(dlqEntries);
+      if (writtenToEs >= expectedWritten && quarantined >= corruptedTarget) {
         break;
+      }
+
+      if (nowFn() - lastLog >= 5000) {
+        lastLog = nowFn();
+        log(`Ingesting: ${writtenToEs}/${expectedWritten} written, ${quarantined}/${corruptedTarget} in DLQ...`);
       }
     }
 
     // Flush Lucene buffers before final reconciliation
-    try {
-      await refreshEsFn();
-    } catch {
-      // Ignore refresh error
-    }
-    const finalCount = await esCountFn();
+    await safeRefresh();
+    const finalCount = await esCountFn().catch(() => null);
     if (finalCount !== null) {
       currentEsCount = finalCount;
     }
@@ -107,7 +137,7 @@ async function runGate4(options = {}) {
     // -------------------------------------------------------------------------
     // Step 4: Sink Commit Reconciliation
     // -------------------------------------------------------------------------
-    const writtenCount = options.simulatedWrittenCount ?? (currentEsCount - initialEsCount);
+    const writtenCount = currentEsCount - initialEsCount;
     const batchRolledBack = writtenCount === 0;
 
     if (batchRolledBack) {
@@ -126,13 +156,10 @@ async function runGate4(options = {}) {
       // Ignore
     }
 
-    const dlqRows = options.simulatedDlqRows ?? dlqEntries;
+    const dlqRows = dlqEntries;
 
-    // Deduplicate by record_id if multiple sinks routed the same record, or take unique record count
-    const uniqueRecordIds = new Set(dlqRows.map((r) => r.record_id || r.id));
-    const dlqCount = options.simulatedDlqRows !== undefined
-      ? options.simulatedDlqRows.length
-      : (uniqueRecordIds.size > 0 ? uniqueRecordIds.size : dlqRows.length);
+    // A poison pill may be dead-lettered once per sink; count distinct quarantined source records.
+    const dlqCount = uniqueDlqRecords(dlqRows);
 
     // Verify sufficient retry context: non-null payload, error_code, error_message, PENDING status
     let contextSufficient = dlqCount === corruptedTarget;
@@ -165,13 +192,18 @@ async function runGate4(options = {}) {
       batchRolledBack,
       contextSufficient
     );
+    result.quiesced = quiesce.quiesced;
 
-    console.log(result.output);
+    if (!options.silent) {
+      console.log(result.output);
+    }
     return result;
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     const failureOutput = formatGateResult('G4 partial batch failure', 'FAIL', errorMsg);
-    console.error(failureOutput);
+    if (!options.silent) {
+      console.error(failureOutput);
+    }
     return {
       passed: false,
       writtenCount: 0,

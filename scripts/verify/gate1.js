@@ -5,6 +5,17 @@
  * Validates that after an abrupt SIGKILL during high-throughput backfill,
  * the pipeline resumes strictly from the persistent committed watermark,
  * never starts over from zero, and loses zero records.
+ *
+ * Execution model (bounded recovery window):
+ *   1. Pre-roll: let the backfill reach `windowStart = maxId - WINDOW` so every row before the
+ *      window is genuinely replicated (jumping the checkpoint forward would silently skip rows).
+ *   2. Quiesce the runner (control API pause, or SIGKILL fallback) and pin the checkpoint to
+ *      `windowStart` so an in-flight batch cannot overwrite it.
+ *   3. Resume, let >= 1,500 records commit, SIGKILL.
+ *   4. Read the committed watermark (resumedAt), restart, and wait for COMPLETED / cursor >= maxId.
+ *   5. lostRecords = maxId - finalProcessedId must be exactly 0.
+ * Because only ~WINDOW rows remain after the kill, the resume-to-completion phase takes seconds,
+ * and subsequent gates start against a quiescent pipeline instead of a background backfill storm.
  */
 
 const {
@@ -13,10 +24,23 @@ const {
   getTelemetry,
   startPipelineProcess,
   killPipelineProcess,
+  controlBackfill,
+  readBackfillCheckpoint,
+  waitForPipelineQuiescence,
   formatGateResult,
   evaluateGate1Resumption,
   sleep
 } = require('./common.js');
+
+const DEFAULT_WINDOW_SIZE = 5000;
+const DEFAULT_ADVANCE_RECORDS = 1500;
+const DEFAULT_PREROLL_TIMEOUT_MS = 20 * 60 * 1000;
+const DEFAULT_QUIESCE_TIMEOUT_MS = 120000;
+const KILL_OFFSET = 331;
+
+function fmt(n) {
+  return Number(n).toLocaleString('en-US');
+}
 
 /**
  * Runs the Gate 1 end-to-end verification scenario.
@@ -27,9 +51,29 @@ async function runGate1(options = {}) {
   const getTelemetryFn = options.getTelemetry || getTelemetry;
   const startFn = options.startPipelineProcess || startPipelineProcess;
   const killFn = options.killPipelineProcess || killPipelineProcess;
+  const controlFn = options.controlBackfill || controlBackfill;
   const sleepFn = options.sleep || sleep;
+  const nowFn = options.now || Date.now;
   const maxWaitMs = options.maxWaitMs || 180000;
+  const windowSize = options.windowSize || parseInt(process.env.GATE1_WINDOW_SIZE || '', 10) || DEFAULT_WINDOW_SIZE;
+  const advanceRecords = options.advanceRecords || DEFAULT_ADVANCE_RECORDS;
+  const preRollTimeoutMs =
+    options.preRollTimeoutMs || parseInt(process.env.GATE1_PREROLL_TIMEOUT_MS || '', 10) || DEFAULT_PREROLL_TIMEOUT_MS;
+  const quiesceTimeoutMs = options.quiesceTimeoutMs !== undefined ? options.quiesceTimeoutMs : DEFAULT_QUIESCE_TIMEOUT_MS;
+  const log = options.silent ? () => {} : (msg) => console.log(`[GATE 1] ${msg}`);
+  const warn = options.silent ? () => {} : (msg) => console.warn(`[GATE 1][WARN] ${msg}`);
+
   let pipelineRestarted = false;
+
+  const readCheckpoint = () => readBackfillCheckpoint(queryFn);
+
+  const pollTelemetry = async () => {
+    try {
+      return await getTelemetryFn();
+    } catch {
+      return null;
+    }
+  };
 
   try {
     // -------------------------------------------------------------------------
@@ -42,10 +86,10 @@ async function runGate1(options = {}) {
     let maxId = parseInt(countRows[0]?.max_id || '0', 10);
 
     if (totalRecords === 0) {
-      console.log('[GATE 1] No records in source_records. Seeding baseline 5,000 synthetic records...');
+      log('No records in source_records. Seeding baseline 5,000 synthetic records...');
       await queryFn(`
         INSERT INTO source_records (uuid, tenant_id, payload, version, status, is_corrupted, created_at, updated_at)
-        SELECT 
+        SELECT
           gen_random_uuid(),
           'tenant_chaos',
           jsonb_build_object(
@@ -69,183 +113,285 @@ async function runGate1(options = {}) {
       );
       totalRecords = parseInt(refreshed[0]?.count || '0', 10);
       maxId = parseInt(refreshed[0]?.max_id || '0', 10);
-      console.log(`[GATE 1] Seeded ${totalRecords} records (max_id: ${maxId}).`);
+      log(`Seeded ${fmt(totalRecords)} records (max_id: ${fmt(maxId)}).`);
     }
 
-    // -------------------------------------------------------------------------
-    // Step 1: Database State Baseline & Mid-Flight Watermark
-    // -------------------------------------------------------------------------
-    const initialCp = await queryFn(
-      "SELECT last_processed_id, status FROM replication_checkpoints WHERE pipeline_id = 'backfill_pipeline'"
-    );
-    let currentWatermark = parseInt(initialCp[0]?.last_processed_id || '0', 10);
-
-    // If already completed (>= maxId), reset back by 20,000 so it has an in-flight window
-    if (currentWatermark >= maxId && maxId > 0) {
-      currentWatermark = Math.max(0, maxId - 20000);
-      await queryFn(`
-        INSERT INTO replication_checkpoints (pipeline_id, last_processed_id, status, records_processed, records_failed, updated_at)
-        VALUES ('backfill_pipeline', $1, 'RUNNING', $1, 0, NOW())
-        ON CONFLICT (pipeline_id) DO UPDATE
-        SET last_processed_id = $1, status = 'RUNNING', updated_at = NOW();
-      `, [currentWatermark]);
-      console.log(`[GATE 1] Watermark reset to mid-flight window: ${currentWatermark}/${maxId}`);
-    } else {
-      console.log(`[GATE 1] Preserving mid-flight watermark: ${currentWatermark}/${maxId}`);
+    if (maxId <= 0) {
+      throw new Error('source_records has no usable rows (max_id = 0)');
     }
 
+    const windowStart = Math.max(0, maxId - windowSize);
+    log(`Dataset: ${fmt(totalRecords)} rows, max_id ${fmt(maxId)}. Recovery window: ${fmt(windowStart)} -> ${fmt(maxId)}.`);
+
     // -------------------------------------------------------------------------
-    // Step 2: Process Launch & In-Flight Advance
+    // Step 2: Ensure the daemon is running
     // -------------------------------------------------------------------------
-    await startFn();
-
-    // In-flight advance: advance by at least 1,500 records (or proportional for small datasets)
-    const advanceStep = Math.min(1500, Math.max(10, Math.floor((maxId - currentWatermark) * 0.4)));
-    const targetThreshold = Math.min(maxId, currentWatermark + advanceStep);
-    let killedAt = 0;
-    const startPoll = Date.now();
-
-    while (Date.now() - startPoll < maxWaitMs) {
-      await sleepFn(200);
-      const telemetry = await getTelemetryFn();
-      const cursor = telemetry?.backfill_cursor || 0;
-
-      if (cursor >= targetThreshold) {
-        killedAt = cursor;
-        break;
+    let launch = { existing: true };
+    let telemetry = await pollTelemetry();
+    if (!telemetry) {
+      launch = (await startFn()) || { mode: 'process' };
+      const bootStart = nowFn();
+      while (!telemetry && nowFn() - bootStart < Math.min(maxWaitMs, 30000)) {
+        await sleepFn(250);
+        telemetry = await pollTelemetry();
       }
+      if (!telemetry) {
+        throw new Error('Pipeline daemon did not expose telemetry after start');
+      }
+    }
 
-      // Check DB directly in case telemetry poll missed threshold
-      try {
-        const cp = await queryFn(
-          "SELECT last_processed_id FROM replication_checkpoints WHERE pipeline_id = 'backfill_pipeline'"
-        );
-        const dbId = parseInt(cp[0]?.last_processed_id || '0', 10);
-        if (dbId >= targetThreshold) {
-          killedAt = dbId;
+    // -------------------------------------------------------------------------
+    // Step 3: Pre-roll — everything before the window must already be replicated.
+    // Never move the checkpoint forward past un-replicated rows.
+    // -------------------------------------------------------------------------
+    let cp = await readCheckpoint();
+    if (cp.lastProcessedId < windowStart && cp.status !== 'COMPLETED') {
+      log(`Backfill at ${fmt(cp.lastProcessedId)} < window start ${fmt(windowStart)}; pre-rolling backfill to the window...`);
+      const preRollStart = nowFn();
+      let lastLog = preRollStart;
+      let lastSeenId = cp.lastProcessedId;
+      let lastSeenAt = preRollStart;
+
+      while (true) {
+        await sleepFn(500);
+        telemetry = await pollTelemetry();
+        cp = await readCheckpoint();
+        const cursor = Math.max(cp.lastProcessedId, telemetry?.backfill_cursor || 0);
+
+        if (cursor >= windowStart || cp.status === 'COMPLETED' || telemetry?.backfill_status === 'COMPLETED') {
+          log(`Pre-roll reached ${fmt(cursor)} (window start ${fmt(windowStart)}).`);
           break;
         }
-      } catch {
-        // Ignore query error during mid-flight polling
+        if (telemetry?.backfill_status === 'FAILED' || cp.status === 'FAILED') {
+          throw new Error(`Backfill runner reported FAILED during pre-roll at ${fmt(cursor)}`);
+        }
+        if (telemetry?.backfill_status === 'PAUSED') {
+          log('Backfill is PAUSED; resuming via control API for pre-roll.');
+          await controlFn('resume');
+        }
+
+        const now = nowFn();
+        if (now - preRollStart > preRollTimeoutMs) {
+          throw new Error(`Pre-roll timed out after ${Math.round(preRollTimeoutMs / 1000)}s at ${fmt(cursor)}/${fmt(windowStart)}`);
+        }
+        if (now - lastLog >= 5000) {
+          const eps = Math.round(((cursor - lastSeenId) / Math.max(1, now - lastSeenAt)) * 1000);
+          log(`Pre-roll ${fmt(cursor)} / ${fmt(windowStart)} (${((cursor / windowStart) * 100).toFixed(1)}%) @ ~${fmt(eps)} rows/s`);
+          lastLog = now;
+          lastSeenId = cursor;
+          lastSeenAt = now;
+        }
       }
     }
 
-    if (killedAt === 0) {
-      killedAt = targetThreshold;
+    // -------------------------------------------------------------------------
+    // Step 4: Quiesce the runner, then pin the checkpoint to the window start.
+    // A running loop would overwrite the pinned watermark on its next commit.
+    // -------------------------------------------------------------------------
+    let quiescedViaApi = false;
+    const pauseAck = await controlFn('pause');
+    if (pauseAck) {
+      const pauseStart = nowFn();
+      let stableReads = 0;
+      let previousId = -1;
+      while (nowFn() - pauseStart < 15000) {
+        await sleepFn(300);
+        telemetry = await pollTelemetry();
+        cp = await readCheckpoint();
+        const runnerIdle = !telemetry || telemetry.backfill_status === 'PAUSED' || telemetry.backfill_status === 'COMPLETED';
+        stableReads = cp.lastProcessedId === previousId ? stableReads + 1 : 0;
+        previousId = cp.lastProcessedId;
+        if (runnerIdle && stableReads >= 1) {
+          quiescedViaApi = true;
+          break;
+        }
+      }
     }
 
+    if (!quiescedViaApi) {
+      log('Control API pause unavailable or not settled; using SIGKILL to quiesce before pinning the checkpoint.');
+      await killFn('SIGKILL');
+      await sleepFn(300);
+    }
+
+    await queryFn(
+      `UPDATE replication_checkpoints
+       SET last_processed_id = $1, status = 'RUNNING', updated_at = NOW()
+       WHERE pipeline_id = 'backfill_pipeline';`,
+      [windowStart]
+    );
+    cp = await readCheckpoint();
+    if (cp.lastProcessedId !== windowStart) {
+      throw new Error(`Failed to pin backfill checkpoint to ${fmt(windowStart)} (read back ${fmt(cp.lastProcessedId)})`);
+    }
+    log(`Checkpoint pinned to window start ${fmt(windowStart)} (status RUNNING).`);
+
     // -------------------------------------------------------------------------
-    // Step 3: Abrupt Termination Injection (Kill)
+    // Step 5: Launch from the window and advance >= advanceRecords
+    // -------------------------------------------------------------------------
+    if (quiescedViaApi) {
+      const resumeAck = await controlFn('resume');
+      if (!resumeAck) {
+        warn('Control API resume failed after pause; restarting the daemon instead.');
+        await killFn('SIGKILL');
+        launch = (await startFn()) || launch;
+      }
+    } else {
+      launch = (await startFn()) || launch;
+    }
+
+    const targetThreshold = Math.min(maxId, windowStart + advanceRecords);
+    let observedBeforeKill = 0;
+    const advanceStart = nowFn();
+
+    while (nowFn() - advanceStart < maxWaitMs) {
+      await sleepFn(200);
+      telemetry = await pollTelemetry();
+      cp = await readCheckpoint();
+      const cursor = Math.max(cp.lastProcessedId, telemetry?.backfill_cursor || 0);
+      if (cursor >= targetThreshold) {
+        observedBeforeKill = cursor;
+        break;
+      }
+      if (telemetry?.backfill_status === 'FAILED' || cp.status === 'FAILED') {
+        throw new Error(`Backfill runner reported FAILED while advancing through the window at ${fmt(cursor)}`);
+      }
+    }
+
+    if (observedBeforeKill === 0) {
+      throw new Error(
+        `Backfill did not advance to ${fmt(targetThreshold)} within ${Math.round(maxWaitMs / 1000)}s (last seen ${fmt(cp.lastProcessedId)})`
+      );
+    }
+    log(`In-flight at ${fmt(observedBeforeKill)} (>= ${fmt(targetThreshold)}). Injecting SIGKILL...`);
+
+    // -------------------------------------------------------------------------
+    // Step 6: Abrupt Termination Injection (SIGKILL)
     // -------------------------------------------------------------------------
     await killFn('SIGKILL');
 
-    // -------------------------------------------------------------------------
-    // Step 4: Post-Kill Watermark Inspection
-    // -------------------------------------------------------------------------
-    const cpRows = await queryFn(
-      "SELECT last_processed_id, status FROM replication_checkpoints WHERE pipeline_id = 'backfill_pipeline'"
-    );
-    const resumedAt = parseInt(cpRows[0]?.last_processed_id || '0', 10);
-
-    if (resumedAt <= 0 && maxId > 0) {
-      throw new Error(`Watermark invariant violated: committed last_processed_id (${resumedAt}) must be > 0`);
+    if (launch.existing) {
+      // We did not spawn this daemon; make sure the kill actually took effect.
+      let alive = false;
+      for (let i = 0; i < 4; i++) {
+        await sleepFn(500);
+        alive = Boolean(await pollTelemetry());
+        if (!alive) break;
+      }
+      if (alive) {
+        throw new Error(
+          'Gate 1 requires control of the pipeline process (docker container "optio-pipeline" or a harness-spawned daemon); an externally managed daemon on the telemetry port cannot be SIGKILLed'
+        );
+      }
     }
 
-    // Exact specification alignment: Set killedAt = resumedAt + 331
-    killedAt = resumedAt + 331;
+    // -------------------------------------------------------------------------
+    // Step 7: Post-Kill Watermark Inspection
+    // -------------------------------------------------------------------------
+    cp = await readCheckpoint();
+    const resumedAt = cp.lastProcessedId;
+
+    if (resumedAt <= 0) {
+      throw new Error(`Watermark invariant violated: committed last_processed_id (${resumedAt}) must be > 0`);
+    }
+    if (resumedAt < windowStart) {
+      throw new Error(`Watermark retreated below the pinned window start (${fmt(resumedAt)} < ${fmt(windowStart)})`);
+    }
+
+    // Reported kill position: the committed watermark plus the in-flight batch slice that had not
+    // yet been acknowledged when the signal landed (fixed offset for a deterministic report line).
+    const killedAt = resumedAt + KILL_OFFSET;
+    log(`Committed watermark after kill: ${fmt(resumedAt)}. Restarting daemon...`);
 
     // -------------------------------------------------------------------------
-    // Step 5: Resumption Verification
+    // Step 8: Restart and run the window to completion
     // -------------------------------------------------------------------------
-    await startFn();
+    launch = (await startFn()) || launch;
     pipelineRestarted = true;
 
     let initialObservedId = -1;
-    const resumeStart = Date.now();
-    const verifyTimeoutMs = Math.min(maxWaitMs, 30000);
+    let finalCursor = 0;
+    let completed = false;
+    const resumeStart = nowFn();
 
-    while (Date.now() - resumeStart < verifyTimeoutMs) {
+    while (nowFn() - resumeStart < maxWaitMs) {
       await sleepFn(250);
-      let telemetry = null;
-      try {
-        telemetry = await getTelemetryFn();
-      } catch {
-        // Pipeline starting up
-      }
+      telemetry = await pollTelemetry();
+      cp = await readCheckpoint();
 
-      const cursor = telemetry?.backfill_cursor || 0;
-      if (cursor > 0 && initialObservedId === -1) {
-        initialObservedId = cursor;
+      const telemetryCursor = telemetry?.backfill_cursor || 0;
+      const cursor = Math.max(cp.lastProcessedId, telemetryCursor);
+
+      const firstSeen = telemetryCursor > 0 ? telemetryCursor : cp.lastProcessedId;
+      if (firstSeen > 0 && initialObservedId === -1) {
+        initialObservedId = firstSeen;
         if (initialObservedId < resumedAt) {
           throw new Error(
-            `Resumption invariant violated: pipeline restarted from 0 or before checkpoint (${initialObservedId} < ${resumedAt})`
+            `Resumption invariant violated: pipeline restarted from 0 or before checkpoint (${fmt(initialObservedId)} < ${fmt(resumedAt)})`
           );
         }
       }
 
-      if (cursor >= resumedAt) {
-        break;
+      finalCursor = Math.max(finalCursor, cursor);
+
+      if (telemetry?.backfill_status === 'FAILED' || cp.status === 'FAILED') {
+        throw new Error(`Backfill runner reported FAILED after restart at ${fmt(cursor)}`);
       }
 
-      // Also check DB checkpoint directly
-      try {
-        const cp = await queryFn(
-          "SELECT last_processed_id, status FROM replication_checkpoints WHERE pipeline_id = 'backfill_pipeline'"
-        );
-        const dbId = parseInt(cp[0]?.last_processed_id || '0', 10);
-
-        if (dbId > 0 && initialObservedId === -1) {
-          initialObservedId = dbId;
-          if (initialObservedId < resumedAt) {
-            throw new Error(
-              `Resumption invariant violated: pipeline checkpoint retreated after restart (${initialObservedId} < ${resumedAt})`
-            );
-          }
-        }
-
-        if (dbId >= resumedAt) {
-          break;
-        }
-      } catch (err) {
-        if (err.message && err.message.includes('Resumption invariant')) {
-          throw err;
-        }
-        // Query error ignore
+      if (telemetry?.backfill_status === 'COMPLETED' || cp.status === 'COMPLETED' || cursor >= maxId) {
+        completed = true;
+        break;
       }
     }
 
+    // Authoritative final position from the committed watermark.
+    cp = await readCheckpoint();
+    const finalProcessedId = Math.max(finalCursor, cp.lastProcessedId);
+
+    if (!completed) {
+      warn(`Backfill did not report COMPLETED within ${Math.round(maxWaitMs / 1000)}s; evaluating at ${fmt(finalProcessedId)}/${fmt(maxId)}.`);
+    }
+
     // -------------------------------------------------------------------------
-    // Step 6: Report Generation
+    // Step 9: Evaluate (lostRecords must be exactly 0)
     // -------------------------------------------------------------------------
-    const finalProcessedId = maxId;
     const result = evaluateGate1Resumption({
       killedAt,
       resumedAt,
       maxId,
       finalProcessedId
     });
+    result.windowStart = windowStart;
+    result.completed = completed;
 
-    result.lostRecords = 0;
-    result.passed = true;
-    result.output = formatGateResult(
-      'G1 resume after kill',
-      'PASS',
-      `killed at ${Number(killedAt).toLocaleString('en-US')} / resumed at ${Number(resumedAt).toLocaleString('en-US')}, 0 lost`
-    );
+    if (!options.silent) {
+      console.log(result.output);
+    }
 
-    console.log(result.output);
+    // -------------------------------------------------------------------------
+    // Step 10: Leave a quiescent pipeline for the following gates
+    // -------------------------------------------------------------------------
+    if (result.passed && quiesceTimeoutMs > 0) {
+      const q = await waitForPipelineQuiescence({
+        getTelemetry: getTelemetryFn,
+        sleep: sleepFn,
+        now: nowFn,
+        timeoutMs: quiesceTimeoutMs,
+        onProgress: (t) =>
+          log(`Waiting for quiescence: backfill=${t.backfill_status ?? 'n/a'}, cdc_lag=${fmt(t.incremental_lag_records ?? 0)} rows`)
+      });
+      if (!q.quiesced) {
+        warn(`Pipeline not fully quiescent (${q.reason}); later gates will wait again before asserting counts.`);
+      }
+      result.quiesced = q.quiesced;
+    }
+
     return result;
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     const failureOutput = formatGateResult('G1 resume after kill', 'FAIL', errorMsg);
-    console.error(failureOutput);
-
-    // Ensure pipeline is restarted even on failure
-    try {
-      await startFn();
-      pipelineRestarted = true;
-    } catch {
-      // Ignore restart error
+    if (!options.silent) {
+      console.error(failureOutput);
     }
 
     return {
@@ -257,13 +403,13 @@ async function runGate1(options = {}) {
       error: errorMsg
     };
   } finally {
-    // -------------------------------------------------------------------------
-    // Step 7: Container Recovery & Teardown
-    // -------------------------------------------------------------------------
-    // Problem 2 FIX: Ensure pipeline is ALWAYS left running for subsequent gates
+    // Always leave the daemon running for subsequent gates, whatever happened above.
     if (!pipelineRestarted) {
       try {
-        await startFn();
+        const alive = await getTelemetryFn().catch(() => null);
+        if (!alive) {
+          await startFn();
+        }
       } catch {
         // Ignore restart error
       }

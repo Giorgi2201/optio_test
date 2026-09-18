@@ -100,80 +100,187 @@ describe('Gate 1 Verification - Crash Recovery & Watermark Resumption', () => {
     assert.match(result.output, /FAIL/);
   });
 
-  it('6. Orchestration Flow: Executes full Gate 1 lifecycle with mocked process & telemetry dependencies', async () => {
-    const killEvents = [];
-    const startEvents = [];
-    let queryCallCount = 0;
-    let telemetryPollCount = 0;
+  /**
+   * Builds a deterministic fake pipeline for orchestration tests.
+   * The backfill runner advances `stepPerPoll` rows per telemetry poll while RUNNING and commits
+   * its watermark to the fake checkpoint row; SIGKILL makes telemetry unreachable until restart.
+   */
+  function createFakePipeline({ maxId, initialCheckpoint, initialStatus, stepPerPoll = 500, stallAt = null }) {
+    const state = {
+      dbId: initialCheckpoint,
+      dbStatus: initialStatus,
+      cursor: initialCheckpoint,
+      status: initialStatus,
+      killed: false,
+      lag: 0
+    };
+    const events = { kills: [], starts: [], controls: [], checkpointWrites: [] };
+    let fakeNow = 1_000_000;
 
-    const mockQueryDatabase = async (sql) => {
-      queryCallCount++;
-      if (sql.includes('COUNT(*)')) {
-        return [{ count: '5000', max_id: '5000' }];
+    const advance = () => {
+      if (state.status !== 'RUNNING') return;
+      let next = Math.min(maxId, state.cursor + stepPerPoll);
+      if (stallAt !== null) next = Math.min(next, stallAt);
+      state.cursor = next;
+      state.dbId = next;
+      if (next >= maxId) {
+        state.status = 'COMPLETED';
+        state.dbStatus = 'COMPLETED';
       }
-      if (sql.includes('replication_checkpoints') && sql.includes('SELECT')) {
-        // Initial watermark: 0, post-kill watermark: 2000, final completed: 5000
-        return [{
-          last_processed_id: killEvents.length > 0 && startEvents.length > 1 ? '5000' : (killEvents.length > 0 ? '2000' : '0'),
-          status: 'COMPLETED'
-        }];
-      }
-      return [];
     };
 
-    const mockGetTelemetry = async () => {
-      telemetryPollCount++;
-      // Pre-kill phase: advance cursor past midway threshold (2000)
-      if (killEvents.length === 0) {
+    return {
+      state,
+      events,
+      now: () => fakeNow,
+      sleep: async (ms) => {
+        fakeNow += ms;
+      },
+      queryDatabase: async (sql, params = []) => {
+        if (sql.includes('COUNT(*)')) {
+          return [{ count: String(maxId), max_id: String(maxId) }];
+        }
+        if (sql.includes('UPDATE replication_checkpoints')) {
+          state.dbId = params[0];
+          state.dbStatus = 'RUNNING';
+          events.checkpointWrites.push(params[0]);
+          return [];
+        }
+        if (sql.includes('replication_checkpoints') && sql.includes('SELECT')) {
+          return [{ last_processed_id: String(state.dbId), status: state.dbStatus }];
+        }
+        return [];
+      },
+      getTelemetry: async () => {
+        if (state.killed) return null;
+        advance();
         return {
           status: 'RUNNING',
-          backfill_status: 'RUNNING',
-          backfill_cursor: 2000,
-          backfill_completion_pct: 40.0
+          backfill_status: state.status,
+          backfill_cursor: state.cursor,
+          incremental_lag_records: state.lag
         };
+      },
+      controlBackfill: async (action) => {
+        events.controls.push(action);
+        if (state.killed) return null;
+        if (action === 'pause') {
+          state.status = 'PAUSED';
+          return { status: 'PAUSED', pipeline: 'backfill' };
+        }
+        // resume() re-reads the persisted checkpoint exactly like the real runner
+        state.cursor = state.dbId;
+        state.status = 'RUNNING';
+        state.dbStatus = 'RUNNING';
+        return { status: 'RUNNING', pipeline: 'backfill' };
+      },
+      startPipelineProcess: async () => {
+        events.starts.push(fakeNow);
+        state.killed = false;
+        state.cursor = state.dbId;
+        state.status = 'RUNNING';
+        state.dbStatus = 'RUNNING';
+        return { mode: 'process', pid: 12345 };
+      },
+      killPipelineProcess: async (signal) => {
+        events.kills.push(signal || 'SIGKILL');
+        state.killed = true;
       }
-      // Post-kill resumption phase: reaches end
-      return {
-        status: 'RUNNING',
-        backfill_status: 'COMPLETED',
-        backfill_cursor: 5000,
-        backfill_completion_pct: 100
-      };
     };
+  }
 
-    const mockStartProcess = async () => {
-      startEvents.push(Date.now());
-      return { mode: 'process', pid: 12345 };
-    };
-
-    const mockKillProcess = async (signal) => {
-      killEvents.push(signal || 'SIGKILL');
-    };
-
-    const mockSleep = async () => {
-      // Instant sleep in mock test
-    };
+  it('6. Orchestration Flow: pins a 5,000-row window, quiesces before the checkpoint write, SIGKILLs mid-window, and resumes to completion with 0 lost', async () => {
+    // Re-run scenario: previous backfill already COMPLETED at 500,000
+    const fake = createFakePipeline({ maxId: 500000, initialCheckpoint: 500000, initialStatus: 'COMPLETED' });
 
     const result = await runGate1({
-      queryDatabase: mockQueryDatabase,
-      getTelemetry: mockGetTelemetry,
-      startPipelineProcess: mockStartProcess,
-      killPipelineProcess: mockKillProcess,
-      sleep: mockSleep,
-      maxWaitMs: 5000,
+      ...fake,
+      maxWaitMs: 30000,
+      quiesceTimeoutMs: 5000,
+      silent: true,
       closeDb: false
     });
 
     assert.equal(result.passed, true);
-    assert.equal(result.killedAt, 2331);
-    assert.equal(result.resumedAt, 2000);
+    assert.equal(result.windowStart, 495000);
+    assert.equal(result.resumedAt, 496500);
+    assert.equal(result.killedAt, 496831);
     assert.equal(result.lostRecords, 0);
+    assert.equal(result.completed, true);
+    assert.equal(result.quiesced, true);
     assert.equal(
       result.output,
-      'G1 resume after kill ............ PASS (killed at 2,331 / resumed at 2,000, 0 lost)'
+      'G1 resume after kill ............ PASS (killed at 496,831 / resumed at 496,500, 0 lost)'
     );
-    assert.equal(killEvents.length >= 1, true);
-    assert.equal(killEvents[0], 'SIGKILL');
-    assert.equal(startEvents.length, 2); // Initial launch + post-kill resume
+
+    // Checkpoint was pinned to the window start exactly once, after the runner was paused
+    assert.deepEqual(fake.events.checkpointWrites, [495000]);
+    assert.deepEqual(fake.events.controls, ['pause', 'resume']);
+    // Exactly one SIGKILL, followed by exactly one restart
+    assert.deepEqual(fake.events.kills, ['SIGKILL']);
+    assert.equal(fake.events.starts.length, 1);
+  });
+
+  it('7. Pre-roll: never jumps the checkpoint forward past un-replicated rows on a fresh dataset', async () => {
+    // Fresh dataset: backfill is mid-storm at 11,000 of 500,000
+    const fake = createFakePipeline({ maxId: 500000, initialCheckpoint: 11000, initialStatus: 'RUNNING', stepPerPoll: 50000 });
+
+    const result = await runGate1({
+      ...fake,
+      maxWaitMs: 30000,
+      preRollTimeoutMs: 600000,
+      quiesceTimeoutMs: 5000,
+      silent: true,
+      closeDb: false
+    });
+
+    assert.equal(result.passed, true);
+    assert.equal(result.lostRecords, 0);
+    // The pin happened only after the runner had genuinely reached the window on its own
+    assert.equal(fake.events.checkpointWrites.length, 1);
+    assert.equal(fake.events.checkpointWrites[0], 495000);
+    assert.match(result.output, /PASS/);
+  });
+
+  it('8. Invariant Rejection: reports FAIL with the real shortfall when the restarted backfill never reaches max_id', async () => {
+    const fake = createFakePipeline({ maxId: 500000, initialCheckpoint: 500000, initialStatus: 'COMPLETED', stallAt: 499000 });
+
+    const result = await runGate1({
+      ...fake,
+      maxWaitMs: 5000,
+      quiesceTimeoutMs: 0,
+      silent: true,
+      closeDb: false
+    });
+
+    assert.equal(result.passed, false);
+    assert.equal(result.lostRecords, 1000);
+    assert.equal(result.completed, false);
+    assert.match(result.output, /FAIL/);
+    assert.match(result.output, /1,000 lost/);
+  });
+
+  it('9. Invariant Rejection: fails when the pipeline restarts from before the committed watermark', async () => {
+    const fake = createFakePipeline({ maxId: 500000, initialCheckpoint: 500000, initialStatus: 'COMPLETED' });
+    const honestStart = fake.startPipelineProcess;
+    fake.startPipelineProcess = async () => {
+      const res = await honestStart();
+      // Simulate a runner that ignores its checkpoint and restarts from zero
+      fake.state.cursor = 0;
+      fake.state.dbId = 0;
+      return res;
+    };
+
+    const result = await runGate1({
+      ...fake,
+      maxWaitMs: 5000,
+      quiesceTimeoutMs: 0,
+      silent: true,
+      closeDb: false
+    });
+
+    assert.equal(result.passed, false);
+    assert.match(result.output, /FAIL/);
+    assert.match(result.error, /Resumption invariant violated/);
   });
 });
