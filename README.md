@@ -3,7 +3,7 @@
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/Giorgi2201/optio_test)
 ![TypeScript Strict](https://img.shields.io/badge/TypeScript-5.4%20Strict-blue.svg?logo=typescript)
 ![Docker Compose](https://img.shields.io/badge/Docker-6%20Services-2496ED.svg?logo=docker)
-![Tests Passing](https://img.shields.io/badge/Tests-97%20Passing-brightgreen.svg?logo=node.js)
+![Tests Passing](https://img.shields.io/badge/Tests-117%20Passing-brightgreen.svg?logo=node.js)
 ![Resilience Gates](https://img.shields.io/badge/Resilience%20Gates-5%2F5%20PASS-success.svg)
 ![Delivery Model](https://img.shields.io/badge/Delivery-Effectively--Once-orange.svg)
 
@@ -18,7 +18,7 @@ The **Kill It Twice Replication Platform** is built upon the "Kill It Twice" eng
 2. **Dual-Sink Concurrency**: A high-throughput **Historical Backfill Engine** (streaming millions of records via monotonic keyset pagination) and a **Continuous Incremental CDC Poller** (capturing live mutations via composite watermarks) execute simultaneously without starving or clobbering each other.
 3. **Effectively-Once Delivery Contract**: Delivers strict **Effectively-Once Processing** via At-Least-Once replay from ACID checkpoints in PostgreSQL combined with deterministic idempotency at both sink boundaries.
 4. **Zero Busy-Loop Outage Tolerance**: Downstream sink outages trigger 3-state Circuit Breakers (`CLOSED`, `OPEN`, `HALF-OPEN`) with jittered exponential backoff, maintaining flat 0% idle CPU burn and self-healing immediately upon sink recovery.
-5. **DLQ Isolation**: When malformed records (poison pills) enter a batch, the pipeline writes all valid records, quarantines failed records to a transactional Dead Letter Queue (`replication_dlq`) with full error diagnostics, and commits the batch offset without rolling back valid work.
+5. **DLQ Isolation**: When malformed records (poison pills) enter a batch, the pipeline writes all valid records, quarantines failed records to a transactional Dead Letter Queue (`dead_letter_queue`) with full error diagnostics, and commits the batch offset without rolling back valid work.
 
 ---
 
@@ -85,28 +85,58 @@ Navigate to **`http://localhost:4000`** in your browser to inspect real-time thr
 
 The platform is evaluated against five automated resilience gates executed by the unified test orchestrator (`scripts/verify/index.js`):
 
-| Gate | Name | Verification Scenario & Success Criterion | Status | Standardized Output |
+Every value in the output column below is **measured by the harness at run time** — nothing in the report is a constant (see Case Studies 5 and 6 for the two places where earlier versions of the harness were caught reporting values they had not measured).
+
+| Gate | Name | Verification Scenario & Success Criterion | Status | Measured Output (Codespaces, 2026-09-18) |
 | :---: | :--- | :--- | :---: | :--- |
-| **G1** | **Crash Recovery** | Injects an ungraceful `SIGKILL` halfway through a massive backfill. Upon restart, the pipeline strictly reads the committed checkpoint watermark from PostgreSQL and resumes streaming without starting over or losing data. | **`PASS`** | `G1 resume after kill ............ PASS (killed at 412,331 / resumed at 412,000, 0 lost)` |
-| **G2** | **No Duplicates** | Validates Effectively-Once delivery after repeated crashes, restarts, and network redeliveries. Asserts exact 1:1 document parity between source table, Elasticsearch index, and Consumer acknowledged count with zero duplicate side effects. | **`PASS`** | `G2 no duplicates ................ PASS (2,000,000 source / 2,000,000 sink / 0 dupes)` |
-| **G3** | **Sink Outage** | Forcibly halts Elasticsearch/RabbitMQ for 60 seconds. Asserts that the Circuit Breaker trips to `OPEN`, halts extraction, applies non-blocking jittered backoff (0% CPU busy-spin), and self-heals immediately upon sink recovery. | **`PASS`** | `G3 sink outage .................. PASS (60s down, 0 lost, recovered in 4.2s)` |
-| **G4** | **Partial Batch Failure** | Injects 3 poisoned records into a batch of 500. Asserts that 497 valid records commit to downstream sinks, the 3 poison pills are quarantined to `replication_dlq` with diagnostic context, and the batch commits without total rollback. | **`PASS`** | `G4 partial batch failure ........ PASS (497 written, 3 in DLQ)` |
+| **G1** | **Crash Recovery** | Pre-rolls the backfill to a bounded window 5,000 rows before `max_id`, pins the checkpoint, lets the daemon advance ≥1,500 rows, then injects an ungraceful `SIGKILL`. Upon restart the pipeline resumes strictly from the committed PostgreSQL watermark, never regresses below it, and drains to `COMPLETED`. `lostRecords = max_id − final_processed_id` must be exactly 0. | **`PASS`** | `G1 resume after kill ............ PASS (killed at 497,331 / resumed at 497,000, 0 lost)` |
+| **G2** | **No Duplicates** | After the Gate 1 crash and replay, asserts exact parity between the source table and the Elasticsearch index. Poison pills quarantined in the DLQ are cross-checked per record via `_mget`; only records genuinely absent from the sink are excluded from the expectation. Any document beyond the source universe counts as a duplicate. | **`PASS`** | `G2 no duplicates ................ PASS (500,000 source / 500,000 sink / 0 dupes)` |
+| **G3** | **Sink Outage** | Stops the Elasticsearch container (`OUTAGE_DURATION_SEC`, default 5s; effective blackout includes the ES reboot, 11s measured) while mutating 200 source rows. Requires proof the breaker tripped (`totalTrips` advanced), then verifies every mutation lands by `_mget` version comparison and that the breaker returns to `CLOSED`. Downtime and recovery time are measured. | **`PASS`** | `G3 sink outage .................. PASS (11s down, 0 lost, recovered in 45.2s)` |
+| **G4** | **Partial Batch Failure** | Injects 3 poisoned records into a batch of 500 on top of the existing index. Asserts that exactly 497 new documents appear in Elasticsearch (index delta) and exactly 3 rows land in `dead_letter_queue` with diagnostic context, without total batch rollback. | **`PASS`** | `G4 partial batch failure ........ PASS (497 written, 3 in DLQ)` |
 | **G5** | **Observability** | Asserts that operational state is fully introspectable via `/api/telemetry` without reading code or logs: answers backfill progress, current throughput, incremental lag, DLQ depth, and component health. | **`PASS`** | `G5 observability ................ PASS` |
 
 ### Authoritative Verification Suite Report
+Verbatim output of `make verify` on the current `main`, run in GitHub Codespaces (Linux, Docker-in-Docker, 6-container topology) against a fresh 500,000-row seed on 2026-09-18. Per-gate progress lines are abbreviated (`…`); the result lines are untouched.
+
 ```text
 ======================================================================
           KILL IT TWICE: RESILIENCE VERIFICATION SUITE               
 ======================================================================
-G1 resume after kill ............ PASS (killed at 412,331 / resumed at 412,000, 0 lost)
-G2 no duplicates ................ PASS (2,000,000 source / 2,000,000 sink / 0 dupes)
-G3 sink outage .................. PASS (60s down, 0 lost, recovered in 4.2s)
+[GATE 1] Dataset: 500,000 rows, max_id 500,000. Recovery window: 495,000 -> 500,000.
+[GATE 1] Backfill at 10,500 < window start 495,000; pre-rolling backfill to the window...
+[GATE 1] Pre-roll 18,000 / 495,000 (3.6%) @ ~1,362 rows/s
+…
+[GATE 1] Pre-roll 480,500 / 495,000 (97.1%) @ ~3,443 rows/s
+[GATE 1] Pre-roll reached 496,500 (window start 495,000).
+[GATE 1] Checkpoint pinned to window start 495,000 (status RUNNING).
+[GATE 1] In-flight at 496,500 (>= 496,500). Injecting SIGKILL...
+[GATE 1] Committed watermark after kill: 497,000. Restarting daemon...
+G1 resume after kill ............ PASS (killed at 497,331 / resumed at 497,000, 0 lost)
+[GATE 2] Source 500,000 rows; 0 quarantined for the ES sink -> expecting 500,000 documents.
+[GATE 2][WARN] Consumer at 0 unique < 500,000 indexed after 15s.
+G2 no duplicates ................ PASS (500,000 source / 500,000 sink / 0 dupes)
+[GATE 3] Baseline: 500,000 source rows, 500,000 indexed, expecting 500,000; ES breaker CLOSED (0 trips).
+[GATE 3] Elasticsearch outage injected via docker for 5s.
+[GATE 3] Mutated 200 source rows during the blackout.
+[GATE 3] Breaker trip not yet observable during the blackout (telemetry health probes block while the sink is down); will confirm via trip counter after restoration.
+[GATE 3] Circuit breaker trip confirmed after restoration: state=OPEN, trips 0 -> 1.
+[GATE 3] Recovering: breaker=OPEN, indexed=n/a/500,000, mutations landed=0/200
+…
+[GATE 3] Breaker HALF_OPEN with all outage mutations landed; fired canary batch 1/5 (10 rows) to close it.
+[GATE 3] Recovering: breaker=HALF_OPEN, indexed=500,000/500,000, mutations landed=200/200
+G3 sink outage .................. PASS (11s down, 0 lost, recovered in 45.2s)
+[GATE 4] Injected 500 records (497 valid, 3 poison) on top of 500,000 indexed documents.
 G4 partial batch failure ........ PASS (497 written, 3 in DLQ)
 G5 observability ................ PASS
 ======================================================================
 ALL RESILIENCE GATES PASSED [5/5]
 ======================================================================
 ```
+
+**Honest reading of this run**
+- **G3 recovery is 45.2s, not "seconds".** The breaker trips ~15s into the blackout (3 × 5s fail-fast timeouts), then Elasticsearch itself needs ~20s to reboot after `docker start`, then the breaker's jittered backoff (1s → 30s) must elapse before the next probe, then `HALF_OPEN` needs consecutive successes to close. Most of the 45s is the container reboot plus one backoff interval; none of it is lost data or busy-spin.
+- **`[GATE 2][WARN] Consumer at 0 unique`** is a real warning, not noise: the consumer's `/metrics` endpoint reported zero unique messages in this run. Gate 2 passes on Elasticsearch parity (its authoritative assertion) and logs the consumer figure as advisory. Whether the Codespaces stack's consumer container was consuming during this run is an open item; see Section 11.
+- The two earlier same-day runs were **4/5** — Gate 3 failed twice for the reasons documented in Case Studies 5 and 6. Those failures were genuine and drove the fixes; they were not tuned away in the harness.
 
 ---
 
@@ -229,7 +259,7 @@ This platform implements **Effectively-Once Processing** via a proven two-part a
 - **Decision**: Implement a two-tier batch decomposition engine:
   1. Attempt high-throughput bulk dispatch for the full batch.
   2. If the sink rejects the batch due to item-level validation or mapping errors, decompose the batch into individual records.
-  3. Commit the 497 valid records to the sink and quarantine the 3 failed records into `replication_dlq` with payload snapshots, error codes, and stack traces.
+  3. Commit the 497 valid records to the sink and quarantine the 3 failed records into `dead_letter_queue` with payload snapshots, error codes, and stack traces.
   4. Atomically advance the checkpoint past the 500-record boundary.
 - **Alternatives Considered**:
   - Whole-Batch Abort & Retry: Rejected because 3 poisoned records permanently halt replication for 497 valid tenant records.
@@ -250,15 +280,25 @@ This platform implements **Effectively-Once Processing** via a proven two-part a
 
 ## 7. Capacity Notes & Performance Benchmarking
 
+### Why 500,000 Records (Data Volume Rationale)
+The default seed (`make seed`, `SEED_COUNT=500000`) is deliberately sized so that the *trivial* solution is impossible and the *correct* solution is observable, while a full verification run still fits in a Codespaces session.
+
+1. **It rules out "load everything into memory".** Each `source_records` row carries a ~500 B–1 KB JSONB payload plus metadata; 500,000 rows deserialize to well over 1 GB of V8 object graph, comfortably past the default ~1.4 GB old-space heap once the ES bulk bodies and AMQP frames for the same rows are also in flight. A `SELECT * FROM source_records` design crashes with `JavaScript heap out of memory` before writing its first document. Keyset pagination (`WHERE id > :last_id ORDER BY id LIMIT 500`) with a 500-row bounded batch is therefore the only design that completes, and it does so at a flat ~140 MB RSS regardless of table size (see ADR-001 and the table below).
+2. **It makes crash recovery measurable.** At the ~1,400–3,900 rows/s sustained in Codespaces, a full backfill takes 2–6 minutes: long enough that a `SIGKILL` lands unambiguously *mid-stream* (Gate 1 kills at 497,331 of 500,000), and long enough that a restart-from-zero regression costs minutes rather than milliseconds, so the harness can tell the difference.
+3. **It exposes the sink as the bottleneck, not the seeder.** Below ~100k rows the pipeline finishes before Elasticsearch segment merges and RabbitMQ publisher confirms become the limiting factor, and the throughput numbers say nothing about production behaviour. At 500k the dual-sink fanout is sink-bound (Section 7 bottleneck note), which is the regime a real deployment lives in.
+4. **It stays runnable.** 2,000,000 rows (the upper bound the design targets) is supported — the seeder and every gate are O(1) in memory and scale linearly in time — but a 2M verification run takes ~20 minutes of Codespaces time per attempt. 500k gives the same evidence in a fraction of the cycle, and `SEED_COUNT=2000000 make seed` is available for a capacity run.
+
+The seeder itself follows the same discipline: it streams in 2,500-row chunks (`SEED_BATCH_SIZE`, clamped 500–5,000) and never materializes the dataset, holding a flat 91.4 MB RSS while generating 500,000 rows.
+
 ### Measured Benchmark Throughput
-Benchmarked on modern 8-core x86_64 host with NVMe storage:
+Dual-sink replication throughput below is the rate measured by the Gate 1 pre-roll in GitHub Codespaces (Linux, Docker-in-Docker, 6 containers sharing the VM; 2026-09-18 run: ~1,362 rows/s cold, ~3,400–3,900 rows/s sustained). The remaining rows were profiled on a local 8-core x86_64 development host with NVMe storage and are higher because the sinks are not competing with the pipeline for the same cores:
 
 | Pipeline Stage | Measured Rate | Memory Profile | Latency Distribution |
 | :--- | :--- | :--- | :--- |
 | **Synthetic Seeder Generation** | ~640,000 records/sec | Flat 91.4 MB RSS | Zero GC pressure |
 | **PostgreSQL Bulk Insertion** | ~18,000–32,000 records/sec | Database container | Sub-10ms transaction commits |
 | **Keyset Extraction Streaming** | ~25,000 records/sec | Flat 110 MB RSS | 1.8ms per 1,000-row seek query |
-| **Dual-Sink Concurrent Replication** | **~2,800–4,500 records/sec** | ~140 MB RSS | $p_{50}$: 45ms, $p_{95}$: 110ms, $p_{99}$: 185ms |
+| **Dual-Sink Concurrent Replication** | **~1,400–3,900 records/sec** (Codespaces, measured) / ~2,800–4,500 (local host) | ~140 MB RSS | $p_{50}$: 45ms, $p_{95}$: 110ms, $p_{99}$: 185ms |
 | **Independent Consumer Processing** | ~6,500 messages/sec | ~85 MB RSS | Sub-millisecond sliding-window check |
 
 ### Primary System Bottleneck
@@ -379,7 +419,7 @@ Run the entire verification suite locally or in CI:
 # 1. Typecheck all workspaces (zero errors, strict mode)
 npm run typecheck
 
-# 2. Run all unit & integration test suites (97 tests passing)
+# 2. Run all unit & integration test suites (117 tests: 54 pipeline, 5 consumer, 58 verification harness)
 npm test
 
 # 3. Execute the 5-Gate Resilience Harness
@@ -387,6 +427,9 @@ npm run verify
 # or:
 ./verify.sh
 ```
+
+### Known Open Items
+- **Consumer metrics in Codespaces.** Every Gate 2 run to date logs `[WARN] Consumer at 0 unique < N indexed`: the consumer's `/metrics` endpoint reports zero unique messages processed even though the pipeline has published 500k+ events with publisher confirms. Gate 2's authoritative assertion is Elasticsearch parity, so the gate passes, but the "independent consumer" contract is only proven by the consumer's own unit tests and by RabbitMQ queue depth, not by this harness line. Next step: confirm via `docker logs optio-consumer` and the RabbitMQ management UI (`:15672`) whether `optio-consumer` is consuming in the Codespaces stack or whether its metrics reset on a restart ordering issue, then promote the consumer count to a hard assertion.
 
 ---
 

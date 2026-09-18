@@ -4,7 +4,7 @@
 - **Author**: Platform Engineering & Core Architecture Team
 - **Evolution Date**: September 2026
 - **Status**: Active / Production Implementation Complete
-- **Revision Summary**: Transition from v1.0 Baseline Draft to v2.0 Battle-Tested Architecture with complete dilemma resolutions, verified resilience gates, and unified 6-container topology.
+- **Revision Summary**: Transition from v1.0 Baseline Draft to v2.0 Battle-Tested Architecture with complete dilemma resolutions, verified resilience gates, and unified 6-container topology. 2026-09-18 amendment: gate figures replaced with measured Codespaces run output; DLQ table named as implemented (`dead_letter_queue`); Gate 3 contract tightened to require fail-fast sink timeouts.
 - **Repository**: `Giorgi2201/optio_test`
 
 ---
@@ -21,7 +21,7 @@ flowchart TD
     subgraph Source["Source Database (ACID Single Source of Truth)"]
         PG[("PostgreSQL<br/>source_records")]
         CP[("PostgreSQL<br/>replication_checkpoints")]
-        DLQ[("PostgreSQL<br/>replication_dlq")]
+        DLQ[("PostgreSQL<br/>dead_letter_queue")]
     end
 
     subgraph PipelineDaemon["Replication Daemon (apps/pipeline :3000)"]
@@ -74,28 +74,30 @@ The platform has been empirically verified across all five Kill-It-Twice resilie
 
 | Gate | Resilience Objective | Verified Production Behavior | Gate Status |
 | :--- | :--- | :--- | :--- |
-| **Gate 1** | **Crash Recovery & Watermark Resumption** | Abrupt process termination (`SIGKILL`, container halt) injected mid-backfill. Upon restart, the pipeline strictly reads the committed checkpoint watermark from PostgreSQL and resumes streaming. Resumes strictly from committed offset (e.g. killed at 412,331 / resumed at 412,000), never restarts from zero, and loses 0 records. | **PASS** |
-| **Gate 2** | **Deduplication & Effectively-Once Delivery** | Guarantees an **Effectively-Once** delivery model via at-least-once transport combined with consumer-side idempotency. After repeated crashes, restarts, and re-deliveries, verified 1:1 document parity between PostgreSQL, Elasticsearch, and RabbitMQ Consumer with **0 duplicate effects** across 2,000,000 records. | **PASS** |
-| **Gate 3** | **Receiver Outage, Zero Busy-Loop & Self-Healing** | When Elasticsearch or RabbitMQ suffers a 60-second outage: Circuit Breaker trips to `OPEN`, halts database extraction, applies jittered exponential backoff (1s -> 30s), exhibits **zero busy-loop CPU burn**, and automatically self-heals to `CLOSED` within seconds of sink recovery. | **PASS** |
-| **Gate 4** | **Partial Batch Failure & DLQ Quarantine** | When 3 out of 500 records are rejected due to invalid schema types (poison pills): 497 valid records are successfully written to sinks, the 3 poison pills are quarantined to `replication_dlq` with full diagnostic error context, and the batch offset commits. Rolling back the entire batch is strictly prevented. | **PASS** |
+| **Gate 1** | **Crash Recovery & Watermark Resumption** | Abrupt process termination (`SIGKILL`, container halt) injected mid-backfill. Upon restart, the pipeline strictly reads the committed checkpoint watermark from PostgreSQL and resumes streaming. Resumes strictly from committed offset (measured: killed at 497,331 / resumed at 497,000 on a 500,000-row seed), never restarts from zero, and loses 0 records. | **PASS** |
+| **Gate 2** | **Deduplication & Effectively-Once Delivery** | Guarantees an **Effectively-Once** delivery model via at-least-once transport combined with consumer-side idempotency. After repeated crashes, restarts, and re-deliveries, verified 1:1 document parity between PostgreSQL and Elasticsearch with **0 duplicate effects** across 500,000 records (2,000,000 supported via `SEED_COUNT`). Consumer parity is currently advisory in the harness — see `README.md §11`, Known Open Items. | **PASS** |
+| **Gate 3** | **Receiver Outage, Zero Busy-Loop & Self-Healing** | When Elasticsearch is stopped (`OUTAGE_DURATION_SEC`, default 5s; 11s effective blackout measured including the container reboot) while source rows are mutating: Circuit Breaker trips to `OPEN` (verified via its `totalTrips` counter), halts database extraction, applies jittered exponential backoff (1s -> 30s), exhibits **zero busy-loop CPU burn**, and self-heals to `CLOSED` with every mutation landed (45.2s measured, dominated by ES reboot plus one backoff interval). Requires fail-fast sink timeouts with client retries disabled — see `README.md` Case Study 6. | **PASS** |
+| **Gate 4** | **Partial Batch Failure & DLQ Quarantine** | When 3 out of 500 records are rejected due to invalid schema types (poison pills): 497 valid records are successfully written to sinks, the 3 poison pills are quarantined to `dead_letter_queue` with full diagnostic error context, and the batch offset commits. Rolling back the entire batch is strictly prevented. | **PASS** |
 | **Gate 5** | **Observability & Introspection** | The operational state is completely inspectable via `/api/telemetry` without reading log files or inspecting source code. Cleanly answers the 5 fundamental operational questions: backfill position, current throughput, incremental lag, DLQ depth, and system health status. | **PASS** |
 
 ### 1.3 Standardized Verification Output (`make verify` / `./verify.sh`)
-The automated verification orchestrator (`scripts/verify/index.js`) executes all five gates sequentially and emits the standardized compliance report:
+The automated verification orchestrator (`scripts/verify/index.js`) executes all five gates sequentially and emits the standardized compliance report. Every number in the result lines is measured at run time. The block below is the result section of the 2026-09-18 Codespaces run against a fresh 500,000-row seed (the full log, including per-gate progress lines, is reproduced in `README.md §3`):
 
 ```text
 ======================================================================
           KILL IT TWICE: RESILIENCE VERIFICATION SUITE               
 ======================================================================
-G1 resume after kill ............ PASS (killed at 412,331 / resumed at 412,000, 0 lost)
-G2 no duplicates ................ PASS (2,000,000 source / 2,000,000 sink / 0 dupes)
-G3 sink outage .................. PASS (60s down, 0 lost, recovered in 4.2s)
+G1 resume after kill ............ PASS (killed at 497,331 / resumed at 497,000, 0 lost)
+G2 no duplicates ................ PASS (500,000 source / 500,000 sink / 0 dupes)
+G3 sink outage .................. PASS (11s down, 0 lost, recovered in 45.2s)
 G4 partial batch failure ........ PASS (497 written, 3 in DLQ)
 G5 observability ................ PASS
 ======================================================================
 ALL RESILIENCE GATES PASSED [5/5]
 ======================================================================
 ```
+
+The v1.0 draft of this section carried the assignment's illustrative figures (`2,000,000 source`, `60s down, recovered in 4.2s`). They were replaced once the harness measured real values; the G3 recovery time in particular is dominated by the Elasticsearch container reboot plus one breaker backoff interval, not by pipeline latency (see `README.md §3`, "Honest reading of this run").
 
 ---
 
@@ -213,7 +215,7 @@ OPTIO/
 │   │   ├── gate1.js - gate5.js # Individual gate verification runners
 │   │   ├── common.js           # Shared evaluation functions & process helpers
 │   │   ├── index.js            # Unified Verification Orchestrator (make verify)
-│   │   └── __tests__/          # 38 unit & logic tests for verification suite
+│   │   └── __tests__/          # 58 unit & logic tests for verification suite
 │   ├── seed.js                 # High-throughput synthetic data seeder
 │   └── migrate.js              # Database migration runner
 ├── .devcontainer/              # GitHub Codespaces Linux container configuration
@@ -241,7 +243,7 @@ All services communicate over an isolated bridge network (`optio-network`):
 1. **PostgreSQL as Single Source of Truth**:
    - Primary transactional business records are persisted in `source_records`.
    - Persistent monotonic watermarks and pipeline checkpoints are stored transactionally in `replication_checkpoints`.
-   - The Dead Letter Queue (DLQ) is stored in `replication_dlq` for ACID durability and operator remediation.
+   - The Dead Letter Queue (DLQ) is stored in `dead_letter_queue` for ACID durability and operator remediation.
 
 2. **Dedicated Independent Consumer Microservice (`apps/consumer`)**:
    - To truly validate RabbitMQ event stream delivery, an independent worker runs out-of-process, binds to the AMQP queue, validates message schemas, and records consumption acknowledgments into a deduplication tracking store.
