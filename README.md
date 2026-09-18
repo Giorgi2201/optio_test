@@ -3,7 +3,7 @@
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/Giorgi2201/optio_test)
 ![TypeScript Strict](https://img.shields.io/badge/TypeScript-5.4%20Strict-blue.svg?logo=typescript)
 ![Docker Compose](https://img.shields.io/badge/Docker-6%20Services-2496ED.svg?logo=docker)
-![Tests Passing](https://img.shields.io/badge/Tests-117%20Passing-brightgreen.svg?logo=node.js)
+![Tests Passing](https://img.shields.io/badge/Tests-120%20Passing-brightgreen.svg?logo=node.js)
 ![Resilience Gates](https://img.shields.io/badge/Resilience%20Gates-5%2F5%20PASS-success.svg)
 ![Delivery Model](https://img.shields.io/badge/Delivery-Effectively--Once-orange.svg)
 
@@ -135,7 +135,7 @@ ALL RESILIENCE GATES PASSED [5/5]
 
 **Honest reading of this run**
 - **G3 recovery is 45.2s, not "seconds".** The breaker trips ~15s into the blackout (3 × 5s fail-fast timeouts), then Elasticsearch itself needs ~20s to reboot after `docker start`, then the breaker's jittered backoff (1s → 30s) must elapse before the next probe, then `HALF_OPEN` needs consecutive successes to close. Most of the 45s is the container reboot plus one backoff interval; none of it is lost data or busy-spin.
-- **`[GATE 2][WARN] Consumer at 0 unique`** is a real warning, not noise: the consumer's `/metrics` endpoint reported zero unique messages in this run. Gate 2 passes on Elasticsearch parity (its authoritative assertion) and logs the consumer figure as advisory. Whether the Codespaces stack's consumer container was consuming during this run is an open item; see Section 11.
+- **`[GATE 2][WARN] Consumer at 0 unique`** is a real warning, not noise: the consumer's `/metrics` endpoint reported zero unique messages in this run. Gate 2 passes on Elasticsearch parity (its authoritative assertion) and logs the consumer figure as advisory. The consumer was in fact **not consuming** during this run — root cause and fix in Case Study 7; status in Section 11.
 - The two earlier same-day runs were **4/5** — Gate 3 failed twice for the reasons documented in Case Studies 5 and 6. Those failures were genuine and drove the fixes; they were not tuned away in the harness.
 
 ---
@@ -381,6 +381,12 @@ In accordance with Section 6 of **`AGENTS.md`**, every architectural deviation, 
 - **Why It Failed**: The hardened Gate 3 (Case Study 5) reported `FAIL (circuit breaker never opened)` even though all 200 mutations replicated after restoration. `bulkUpsert` called `client.bulk()` with no per-request options and `new Client({ node })` used the library defaults — **30s request timeout × 3 retries**. During a 5s `docker stop` the in-flight bulk request simply hung on the dead socket and completed when Elasticsearch came back ~20s later: zero failures ever reached the breaker (`totalTrips` stayed 0), and `/api/telemetry` went dark for the same reason because `cluster.health` inherited the same retry budget. On a slower boot the retry budget ran out instead and the trip appeared 25s *after* restoration — the same defect, a different symptom. The harness was right to fail: a pipeline that can silently block 2 minutes on a sink call is not fail-fast, and its breaker metrics are not trustworthy.
 - **Remediation & Architecture Fix**: [`ElasticsearchSink`](apps/pipeline/src/sinks/elasticsearch/elasticsearch.sink.ts) now passes `{ requestTimeout, maxRetries: 0 }` to both `bulk` and `cluster.health`, and the client is constructed with the same bounds (`ES_REQUEST_TIMEOUT_MS`, default 5000). Client retries are disabled on purpose: the breaker's jittered backoff is the single retry authority. With `failureThreshold: 3` an ES outage becomes observable within ~15s, telemetry stays responsive during outages, and Gate 3's trip-counter evidence is genuine.
 
+### Case Study 7: The Consumer That Lost the Startup Race and Never Tried Again
+- **Task Given**: Build an independent RabbitMQ consumer (`apps/consumer`) that dedups on `message_id` and reports its counts on `/metrics`, so Gate 2 can compare consumer parity with the source.
+- **Specification Assumption**: `SPEC.md §2.2` had the pipeline own the AMQP topology (`ensureRabbitMQTopology`) and the consumer simply subscribe to `replication.events.queue`. `index.ts` wrapped `consumer.start()` in a `try/catch` that logged "will be ready once RabbitMQ is reachable", on the assumption that the only startup failure mode was the broker not being up yet, and that Compose ordering would handle it.
+- **Why It Failed**: Every Codespaces run — including the 5/5 run above — logged `[GATE 2][WARN] Consumer at 0 unique < 500,000 indexed`. The endpoint was reachable, so the consumer process was alive, yet it had processed nothing. In `docker-compose.yml` the consumer depends only on `rabbitmq: service_healthy`, while the pipeline also waits on Elasticsearch, so the consumer reliably boots *first*. `ch.consume()` on a queue nobody has declared yet makes the broker close the channel with `404 NOT_FOUND`; `start()` threw; the catch block logged one line **and never retried**. The HTTP server kept serving zeros indefinitely. The same gap meant a broker restart — the brief's "the broker restarts" scenario — would silently end consumption forever, because the `close` handler cleared state and nothing reconnected. This violated AGENTS.md prohibition 2 (silent error swallowing) and left the "at least one independent consumer" acceptance criterion true only on paper.
+- **Remediation & Architecture Fix**: [`EventConsumerService`](apps/consumer/src/consumer.service.ts) now (1) declares the exchange, queue (with the identical `x-dead-letter-exchange` argument the pipeline uses — a mismatch is rejected by the broker as `PRECONDITION_FAILED`, loudly) and binding **idempotently before consuming**, so boot order relative to the pipeline is irrelevant; and (2) exposes `runSupervised()`, a reconnect loop with bounded exponential backoff and full jitter (1s → 30s) that retries startup failures and re-establishes consumption after a dropped connection. `stop()` cancels any pending reconnect. The connector is injectable, so unit tests 6–8 prove queue declaration, retry-until-success, and reconnect-after-close against a fake broker without RabbitMQ.
+
 ---
 
 ## 10. Repository Structure
@@ -419,7 +425,7 @@ Run the entire verification suite locally or in CI:
 # 1. Typecheck all workspaces (zero errors, strict mode)
 npm run typecheck
 
-# 2. Run all unit & integration test suites (117 tests: 54 pipeline, 5 consumer, 58 verification harness)
+# 2. Run all unit & integration test suites (120 tests: 54 pipeline, 8 consumer, 58 verification harness)
 npm test
 
 # 3. Execute the 5-Gate Resilience Harness
@@ -429,7 +435,7 @@ npm run verify
 ```
 
 ### Known Open Items
-- **Consumer metrics in Codespaces.** Every Gate 2 run to date logs `[WARN] Consumer at 0 unique < N indexed`: the consumer's `/metrics` endpoint reports zero unique messages processed even though the pipeline has published 500k+ events with publisher confirms. Gate 2's authoritative assertion is Elasticsearch parity, so the gate passes, but the "independent consumer" contract is only proven by the consumer's own unit tests and by RabbitMQ queue depth, not by this harness line. Next step: confirm via `docker logs optio-consumer` and the RabbitMQ management UI (`:15672`) whether `optio-consumer` is consuming in the Codespaces stack or whether its metrics reset on a restart ordering issue, then promote the consumer count to a hard assertion.
+- **Consumer parity is still advisory in Gate 2.** Every Codespaces run up to and including the 5/5 run above logged `[WARN] Consumer at 0 unique < N indexed`. The cause was found and fixed after that run (Case Study 7: the consumer booted before the pipeline declared the queue, failed once with `404 NOT_FOUND`, and never retried). The fix is covered by unit tests 6–8 in `apps/consumer` but has **not yet been confirmed by a full `make verify` run**; until it is, the harness keeps the consumer count as a warning rather than a hard assertion, and the acceptance criterion "at least one independent consumer" is evidenced by the consumer's tests and by RabbitMQ queue depth rather than by that harness line. Once a run shows the consumer at parity, the warning should be promoted to a Gate 2 failure condition.
 
 ---
 

@@ -15,9 +15,11 @@ dotenv.config({ path: envPath });
 
 const amqpUrl = process.env.RABBITMQ_URL || 'amqp://optio:optio_secure_pass@localhost:5672';
 const queueName = process.env.RABBITMQ_QUEUE || 'replication.events.queue';
+const exchangeName = process.env.RABBITMQ_EXCHANGE || 'replication.events';
+const dlxExchangeName = process.env.RABBITMQ_DLQ_EXCHANGE || 'replication.dlq.exchange';
 const port = parseInt(process.env.CONSUMER_PORT || '3001', 10);
 
-const consumer = new EventConsumerService({ amqpUrl, queueName });
+const consumer = new EventConsumerService({ amqpUrl, queueName, exchangeName, dlxExchangeName });
 const server = createConsumerServer(consumer, port);
 
 async function bootstrap() {
@@ -32,14 +34,9 @@ async function bootstrap() {
     console.log(`  -> Metrics: http://localhost:${port}/metrics`);
   });
 
-  // Start AMQP Consumer
-  try {
-    await consumer.start();
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`[WARNING] Consumer AMQP startup delayed: ${msg}`);
-    console.log('          Consumer will be ready once RabbitMQ is reachable.');
-  }
+  // Start AMQP Consumer under supervision: retries with jittered backoff if the broker or the
+  // queue is not yet available, and reconnects automatically after a broker restart.
+  consumer.runSupervised();
 
   // Graceful shutdown handling
   const shutdown = async (signal: string) => {

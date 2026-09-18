@@ -9,7 +9,7 @@ import http from 'http';
 import { DeduplicationStore } from '../deduplication.js';
 import { EventConsumerService } from '../consumer.service.js';
 import { createConsumerServer } from '../server.js';
-import { Channel, ConsumeMessage } from 'amqplib';
+import { Channel, ChannelModel, ConsumeMessage } from 'amqplib';
 
 // Helper to construct mock AMQP ConsumeMessage
 function createMockConsumeMessage(
@@ -195,5 +195,156 @@ describe('Independent Event Consumer & Deduplication Engine', () => {
     } finally {
       server.close();
     }
+  });
+
+  // --- Startup ordering & broker-restart resilience -------------------------------------
+
+  interface FakeBroker {
+    connectCalls: number;
+    assertedQueues: Array<{ queue: string; options: unknown }>;
+    assertedExchanges: string[];
+    bindings: Array<{ queue: string; exchange: string; pattern: string }>;
+    consumedQueues: string[];
+    closeHandlers: Array<() => void>;
+    connect: (url: string) => Promise<ChannelModel>;
+  }
+
+  function createFakeBroker(failuresBeforeSuccess = 0): FakeBroker {
+    const broker: FakeBroker = {
+      connectCalls: 0,
+      assertedQueues: [],
+      assertedExchanges: [],
+      bindings: [],
+      consumedQueues: [],
+      closeHandlers: [],
+      connect: async () => {
+        broker.connectCalls++;
+        if (broker.connectCalls <= failuresBeforeSuccess) {
+          throw new Error('ECONNREFUSED broker not ready');
+        }
+        const channel = {
+          on: () => channel,
+          assertExchange: async (exchange: string) => {
+            broker.assertedExchanges.push(exchange);
+            return { exchange };
+          },
+          assertQueue: async (queue: string, options: unknown) => {
+            broker.assertedQueues.push({ queue, options });
+            return { queue, messageCount: 0, consumerCount: 0 };
+          },
+          bindQueue: async (queue: string, exchange: string, pattern: string) => {
+            broker.bindings.push({ queue, exchange, pattern });
+            return {};
+          },
+          prefetch: async () => {},
+          consume: async (queue: string) => {
+            broker.consumedQueues.push(queue);
+            return { consumerTag: `ctag-${broker.connectCalls}` };
+          },
+          cancel: async () => {},
+          close: async () => {},
+          ack: () => {},
+          nack: () => {}
+        };
+        const connection = {
+          on: (event: string, handler: () => void) => {
+            if (event === 'close') broker.closeHandlers.push(handler);
+            return connection;
+          },
+          createChannel: async () => channel,
+          close: async () => {}
+        };
+        return connection as unknown as ChannelModel;
+      }
+    };
+    return broker;
+  }
+
+  it('6. Declares the queue idempotently before consuming so it can boot before the pipeline', async () => {
+    const broker = createFakeBroker();
+    const consumer = new EventConsumerService({
+      queueName: 'replication.events.queue',
+      exchangeName: 'replication.events',
+      dlxExchangeName: 'replication.dlq.exchange',
+      connect: broker.connect
+    });
+
+    await consumer.start();
+
+    // Must mirror apps/pipeline/src/sinks/rabbitmq/topology.ts exactly, or the broker rejects with PRECONDITION_FAILED.
+    assert.deepStrictEqual(broker.assertedExchanges, ['replication.events']);
+    assert.deepStrictEqual(broker.assertedQueues, [
+      {
+        queue: 'replication.events.queue',
+        options: { durable: true, arguments: { 'x-dead-letter-exchange': 'replication.dlq.exchange' } }
+      }
+    ]);
+    assert.deepStrictEqual(broker.bindings, [
+      { queue: 'replication.events.queue', exchange: 'replication.events', pattern: 'record.*' }
+    ]);
+    assert.deepStrictEqual(broker.consumedQueues, ['replication.events.queue']);
+    assert.strictEqual(consumer.healthCheck().healthy, true);
+
+    await consumer.stop();
+  });
+
+  it('7. Supervised start retries with bounded backoff until the broker accepts the connection', async () => {
+    const broker = createFakeBroker(2);
+    const consumer = new EventConsumerService({
+      connect: broker.connect,
+      baseBackoffMs: 5,
+      maxBackoffMs: 20
+    });
+
+    consumer.runSupervised();
+
+    const deadline = Date.now() + 2000;
+    while (!consumer.healthCheck().healthy && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+
+    assert.strictEqual(consumer.healthCheck().healthy, true, 'consumer must eventually come up');
+    assert.strictEqual(broker.connectCalls, 3, 'two refused attempts, then success');
+    assert.deepStrictEqual(broker.consumedQueues, ['replication.events.queue']);
+
+    await consumer.stop();
+  });
+
+  it('8. Reconnects automatically after the broker drops the connection (broker restart)', async () => {
+    const broker = createFakeBroker();
+    const consumer = new EventConsumerService({
+      connect: broker.connect,
+      baseBackoffMs: 5,
+      maxBackoffMs: 20
+    });
+
+    consumer.runSupervised();
+    let deadline = Date.now() + 2000;
+    while (!consumer.healthCheck().healthy && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    assert.strictEqual(broker.connectCalls, 1);
+
+    // Simulate the broker closing the connection out from under us.
+    broker.closeHandlers[0]();
+    assert.strictEqual(consumer.healthCheck().healthy, false, 'health must reflect the dropped connection');
+
+    deadline = Date.now() + 2000;
+    while (broker.connectCalls < 2 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    while (!consumer.healthCheck().healthy && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+
+    assert.strictEqual(broker.connectCalls, 2, 'a fresh connection must be established');
+    assert.strictEqual(consumer.healthCheck().healthy, true);
+    assert.deepStrictEqual(broker.consumedQueues, ['replication.events.queue', 'replication.events.queue']);
+
+    await consumer.stop();
+    // stop() must cancel any pending reconnect so the process can exit.
+    broker.closeHandlers.forEach((h) => h());
+    await new Promise((r) => setTimeout(r, 50));
+    assert.strictEqual(broker.connectCalls, 2, 'no reconnect after an intentional stop');
   });
 });
