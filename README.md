@@ -28,7 +28,7 @@ The **Kill It Twice Replication Platform** is built upon the "Kill It Twice" eng
 For zero-install, 100% Linux container execution with pre-configured Docker-in-Docker:
 1. Click **[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/Giorgi2201/optio_test)**.
 2. Once the Codespace boots, all dependencies and Docker daemon services initialize automatically.
-3. Run `make up && make seed && make verify`.
+3. Run `make up && npm install && make seed && make verify`.
 
 ---
 
