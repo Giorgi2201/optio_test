@@ -9,6 +9,14 @@
  *
  * Runs against a quiescent pipeline (backfill COMPLETED by Gate 1, CDC lag drained) so the
  * parity assertion is exact: esCount === sourceCount - (records rejected by the ES sink into the DLQ).
+ *
+ * Both receivers are asserted, not just the index:
+ * - Elasticsearch must hold exactly the expected document count (and never more than the source universe).
+ * - The independent consumer must report at least as many unique processed events as documents replicated.
+ *   ">=" rather than "===" because every mutation is a distinct versioned event (rec_<id>_v<n>), so a
+ *   consumer that has seen the G3 mutation bursts legitimately exceeds the record count. An unreachable
+ *   consumer, or one below parity, fails the gate: the brief's "at least one independent consumer" is
+ *   part of the delivery contract, not an optional extra.
  */
 
 const {
@@ -26,7 +34,6 @@ const {
 } = require('./common.js');
 
 const DEFAULT_MAX_WAIT_MS = 180000;
-const DEFAULT_CONSUMER_CATCHUP_MS = 15000;
 // Upper bound on quarantined record ids we will cross-check individually against the index.
 const MAX_DLQ_RECORDS_TO_CROSSCHECK = 10000;
 
@@ -48,7 +55,6 @@ async function runGate2(options = {}) {
   const sleepFn = options.sleep || sleep;
   const nowFn = options.now || Date.now;
   const maxWaitMs = options.maxWaitMs !== undefined ? options.maxWaitMs : DEFAULT_MAX_WAIT_MS;
-  const consumerCatchupMs = options.consumerCatchupMs !== undefined ? options.consumerCatchupMs : DEFAULT_CONSUMER_CATCHUP_MS;
   const log = options.silent ? () => {} : (msg) => console.log(`[GATE 2] ${msg}`);
   const warn = options.silent ? () => {} : (msg) => console.warn(`[GATE 2][WARN] ${msg}`);
 
@@ -162,52 +168,59 @@ async function runGate2(options = {}) {
     }
 
     // -------------------------------------------------------------------------
-    // Step 3: Flush Lucene buffers, then let the consumer catch up to the index
+    // Step 3: Flush Lucene buffers, then poll BOTH receivers until parity (bounded budget)
     // -------------------------------------------------------------------------
     await safeRefresh();
     let esCount = await safeEsCount();
     let consumerMetrics = await safeConsumer();
 
-    if (consumerMetrics) {
-      const catchupStart = nowFn();
-      while (
-        nowFn() - catchupStart < consumerCatchupMs &&
-        esCount !== null &&
-        (consumerMetrics?.uniqueProcessed ?? 0) < esCount
-      ) {
-        await sleepFn(500);
-        consumerMetrics = (await safeConsumer()) || consumerMetrics;
-      }
-      if (esCount !== null && (consumerMetrics?.uniqueProcessed ?? 0) < esCount) {
-        warn(`Consumer at ${fmt(consumerMetrics?.uniqueProcessed ?? 0)} unique < ${fmt(esCount)} indexed after ${consumerCatchupMs / 1000}s.`);
-      }
-    } else {
-      log('Consumer metrics endpoint unreachable; skipping consumer catch-up wait.');
-    }
+    const consumerUnique = () => (consumerMetrics ? Number(consumerMetrics.uniqueProcessed ?? 0) : null);
+    const esAtParity = () => esCount === expectation.expectedSinkCount;
+    const consumerAtParity = () => {
+      const unique = consumerUnique();
+      return unique !== null && unique >= expectation.expectedSinkCount;
+    };
 
-    // -------------------------------------------------------------------------
-    // Step 4: Poll Elasticsearch until exact parity (bounded by the remaining budget)
-    // -------------------------------------------------------------------------
     const remainingMs = Math.max(0, maxWaitMs - (nowFn() - gateStart));
     const parityStart = nowFn();
     let lastLog = parityStart;
-    while (esCount !== expectation.expectedSinkCount && nowFn() - parityStart < remainingMs) {
+    while ((!esAtParity() || !consumerAtParity()) && nowFn() - parityStart < remainingMs) {
       await sleepFn(500);
-      await safeRefresh();
-      const next = await safeEsCount();
-      if (next !== null) {
-        esCount = next;
+      if (!esAtParity()) {
+        await safeRefresh();
+        const next = await safeEsCount();
+        if (next !== null) {
+          esCount = next;
+        }
+      }
+      if (!consumerAtParity()) {
+        // Tolerate transient unreachability (consumer restart) by keeping the last good snapshot.
+        consumerMetrics = (await safeConsumer()) || consumerMetrics;
       }
       // Quarantine state can change while we wait (replays, re-processing); re-derive the expectation.
       expectation = await computeExpectation();
       if (nowFn() - lastLog >= 5000) {
         lastLog = nowFn();
-        log(`Elasticsearch ${esCount === null ? 'unreachable' : fmt(esCount)} / ${fmt(expectation.expectedSinkCount)} documents (${fmt(expectation.missingFromSink)} quarantined & absent)...`);
+        const unique = consumerUnique();
+        log(
+          `Elasticsearch ${esCount === null ? 'unreachable' : fmt(esCount)} / ${fmt(expectation.expectedSinkCount)} documents ` +
+            `(${fmt(expectation.missingFromSink)} quarantined & absent); consumer ${unique === null ? 'unreachable' : `${fmt(unique)} unique`}...`
+        );
       }
     }
 
     if (esCount === null) {
       throw new Error('Elasticsearch cluster unreachable or records_search_index not found');
+    }
+
+    if (consumerMetrics) {
+      log(
+        `Consumer: ${fmt(consumerMetrics.uniqueProcessed ?? 0)} unique events processed, ` +
+          `${fmt(consumerMetrics.duplicatesPrevented ?? 0)} redeliveries deduplicated, ` +
+          `${fmt(consumerMetrics.deadLettered ?? 0)} dead-lettered.`
+      );
+    } else {
+      warn('Consumer metrics endpoint unreachable for the whole wait budget; the independent consumer cannot be verified.');
     }
 
     // -------------------------------------------------------------------------
@@ -217,13 +230,13 @@ async function runGate2(options = {}) {
     // way to exceed the source universe is orphan/duplicate documents. A shortfall is missing data, not dupes.
     const { expectedSinkCount, missingFromSink, alreadyIndexed, quarantined } = expectation;
     const duplicates = Math.max(0, esCount - sourceCount);
-    const consumerUniqueCount = consumerMetrics?.uniqueProcessed ?? null;
+    const consumerUniqueCount = consumerUnique();
     const duplicatesPrevented = consumerMetrics?.duplicatesPrevented ?? 0;
 
     const result = evaluateGate2Deduplication(
       sourceCount,
       esCount,
-      consumerUniqueCount === null ? esCount : consumerUniqueCount,
+      consumerUniqueCount,
       duplicates,
       expectedSinkCount
     );
@@ -240,7 +253,7 @@ async function runGate2(options = {}) {
       dlqCount: quarantined,
       dlqAlreadyIndexed: alreadyIndexed,
       dlqMissingFromSink: missingFromSink,
-      consumerUniqueCount: consumerUniqueCount === null ? esCount : consumerUniqueCount,
+      consumerUniqueCount,
       duplicates,
       duplicatesPrevented,
       quiesced: quiesce.quiesced,

@@ -172,7 +172,7 @@ describe('Gate 2 Verification - Deduplication & Effectively-Once Delivery', () =
       getElasticsearchCount: async () => 5000,
       getElasticsearchDocs: async (ids) => ids.map((id) => ({ id: String(id), found: true, source: { id, version: 1 } })),
       refreshElasticsearch: async () => true,
-      getConsumerMetrics: async () => null,
+      getConsumerMetrics: async () => ({ uniqueProcessed: 5000, duplicatesPrevented: 3 }),
       getTelemetry: quiescentTelemetry,
       maxWaitMs: 5000,
       silent: true,
@@ -252,5 +252,85 @@ describe('Gate 2 Verification - Deduplication & Effectively-Once Delivery', () =
     assert.equal(result.passed, false);
     assert.equal(result.duplicates, 50);
     assert.match(result.output, /50 duplicates detected in sink/);
+  });
+
+  // --- Independent consumer is a hard assertion --------------------------------------------
+
+  it('12. Consumer unreachable: the gate fails even with perfect Elasticsearch parity', async () => {
+    let consumerPolls = 0;
+    const result = await runGate2({
+      ...fakeClock(),
+      queryDatabase: async () => [{ total: '5000' }],
+      getElasticsearchCount: async () => 5000,
+      refreshElasticsearch: async () => true,
+      getConsumerMetrics: async () => {
+        consumerPolls++;
+        return null;
+      },
+      getTelemetry: quiescentTelemetry,
+      maxWaitMs: 3000,
+      silent: true,
+      closeDb: false
+    });
+
+    assert.equal(result.passed, false);
+    assert.equal(result.consumerUniqueCount, null);
+    assert.equal(consumerPolls > 1, true, 'must keep retrying the consumer endpoint for the whole budget');
+    assert.match(result.output, /FAIL/);
+    assert.match(result.output, /consumer metrics unreachable/);
+    assert.doesNotMatch(result.output, /Elasticsearch parity failure/);
+  });
+
+  it('13. Consumer below parity: a consumer that silently stopped consuming fails the gate', async () => {
+    const result = await runGate2({
+      ...fakeClock(),
+      queryDatabase: async () => [{ total: '5000' }],
+      getElasticsearchCount: async () => 5000,
+      refreshElasticsearch: async () => true,
+      // Reachable, alive, and never processed anything (Case Study 7 symptom)
+      getConsumerMetrics: async () => ({ uniqueProcessed: 0, duplicatesPrevented: 0 }),
+      getTelemetry: quiescentTelemetry,
+      maxWaitMs: 3000,
+      silent: true,
+      closeDb: false
+    });
+
+    assert.equal(result.passed, false);
+    assert.equal(result.consumerUniqueCount, 0);
+    assert.match(result.output, /consumer parity failure \(0 unique < 5000 replicated\)/);
+  });
+
+  it('14. Consumer catch-up: a lagging consumer that reaches parity within the budget passes, and versioned events above the record count are not duplicates', async () => {
+    let unique = 4000;
+    const result = await runGate2({
+      ...fakeClock(),
+      queryDatabase: async () => [{ total: '5000' }],
+      getElasticsearchCount: async () => 5000,
+      refreshElasticsearch: async () => true,
+      getConsumerMetrics: async () => {
+        unique = Math.min(5213, unique + 400); // drains the backlog, then overshoots with v2 mutation events
+        return { uniqueProcessed: unique, duplicatesPrevented: 13693 };
+      },
+      getTelemetry: quiescentTelemetry,
+      maxWaitMs: 10000,
+      silent: true,
+      closeDb: false
+    });
+
+    assert.equal(result.passed, true);
+    assert.equal(result.consumerUniqueCount >= 5000, true);
+    assert.equal(result.duplicatesPrevented, 13693);
+    assert.equal(result.duplicates, 0);
+    assert.equal(
+      result.output,
+      'G2 no duplicates ................ PASS (5,000 source / 5,000 sink / 0 dupes)'
+    );
+  });
+
+  it('15. Evaluator: null consumer count is a failure, not a pass-through', () => {
+    const result = evaluateGate2Deduplication(5000, 5000, null, 0);
+    assert.equal(result.passed, false);
+    assert.equal(result.consumerUniqueCount, null);
+    assert.match(result.output, /consumer metrics unreachable/);
   });
 });

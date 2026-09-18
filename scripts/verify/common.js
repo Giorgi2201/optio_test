@@ -493,17 +493,21 @@ function evaluateGate1Resumption({ killedAt, resumedAt, maxId, finalProcessedId 
  * Evaluates Gate 2 deduplication and delivery guarantee invariants.
  * Asserts:
  * 1. sourceCount > 0
- * 2. sourceCount === esCount (Elasticsearch 1:1 document parity)
- * 3. sourceCount === consumerUniqueCount (Consumer unique processing parity)
- * 4. duplicateCount === 0 (Zero duplicate records present in sinks)
+ * 2. esCount === expectedSinkCount (Elasticsearch exact document parity; defaults to sourceCount)
+ * 3. consumerUniqueCount >= expectedSinkCount (the independent consumer processed every replicated
+ *    record at least once as a unique event; versioned mutations legitimately push it above the record
+ *    count). A null consumerUniqueCount means the consumer was unreachable and FAILS the gate.
+ * 4. duplicateCount === 0 (Zero duplicate documents present in the index)
  */
 function evaluateGate2Deduplication(sourceCount, esCount, consumerUniqueCount, duplicateCount = 0, expectedSinkCount) {
   const targetSinkCount = expectedSinkCount !== undefined ? expectedSinkCount : sourceCount;
   const sourceValid = sourceCount > 0;
   const esParity = esCount === targetSinkCount;
+  const consumerReachable = consumerUniqueCount !== null && consumerUniqueCount !== undefined;
+  const consumerParity = consumerReachable && Number(consumerUniqueCount) >= targetSinkCount;
   const zeroDuplicates = duplicateCount === 0;
 
-  const passed = sourceValid && esParity && zeroDuplicates;
+  const passed = sourceValid && esParity && consumerParity && zeroDuplicates;
 
   let details;
   if (passed) {
@@ -512,6 +516,8 @@ function evaluateGate2Deduplication(sourceCount, esCount, consumerUniqueCount, d
     const reasons = [];
     if (!sourceValid) reasons.push(`invalid source count (${sourceCount})`);
     if (!esParity) reasons.push(`Elasticsearch parity failure (${targetSinkCount} vs ${esCount})`);
+    if (!consumerReachable) reasons.push('consumer metrics unreachable (independent consumer unverified)');
+    else if (!consumerParity) reasons.push(`consumer parity failure (${consumerUniqueCount} unique < ${targetSinkCount} replicated)`);
     if (!zeroDuplicates) reasons.push(`${duplicateCount} duplicates detected in sink`);
     details = reasons.join(', ');
   }
@@ -522,7 +528,7 @@ function evaluateGate2Deduplication(sourceCount, esCount, consumerUniqueCount, d
     passed,
     sourceCount,
     sinkCount: esCount,
-    consumerUniqueCount,
+    consumerUniqueCount: consumerReachable ? consumerUniqueCount : null,
     duplicates: duplicateCount,
     details,
     output

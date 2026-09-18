@@ -3,7 +3,7 @@
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/Giorgi2201/optio_test)
 ![TypeScript Strict](https://img.shields.io/badge/TypeScript-5.4%20Strict-blue.svg?logo=typescript)
 ![Docker Compose](https://img.shields.io/badge/Docker-6%20Services-2496ED.svg?logo=docker)
-![Tests Passing](https://img.shields.io/badge/Tests-120%20Passing-brightgreen.svg?logo=node.js)
+![Tests Passing](https://img.shields.io/badge/Tests-124%20Passing-brightgreen.svg?logo=node.js)
 ![Resilience Gates](https://img.shields.io/badge/Resilience%20Gates-5%2F5%20PASS-success.svg)
 ![Delivery Model](https://img.shields.io/badge/Delivery-Effectively--Once-orange.svg)
 
@@ -90,42 +90,39 @@ Every value in the output column below is **measured by the harness at run time*
 | Gate | Name | Verification Scenario & Success Criterion | Status | Measured Output (Codespaces, 2026-09-18) |
 | :---: | :--- | :--- | :---: | :--- |
 | **G1** | **Crash Recovery** | Pre-rolls the backfill to a bounded window 5,000 rows before `max_id`, pins the checkpoint, lets the daemon advance ≥1,500 rows, then injects an ungraceful `SIGKILL`. Upon restart the pipeline resumes strictly from the committed PostgreSQL watermark, never regresses below it, and drains to `COMPLETED`. `lostRecords = max_id − final_processed_id` must be exactly 0. | **`PASS`** | `G1 resume after kill ............ PASS (killed at 497,331 / resumed at 497,000, 0 lost)` |
-| **G2** | **No Duplicates** | After the Gate 1 crash and replay, asserts exact parity between the source table and the Elasticsearch index. Poison pills quarantined in the DLQ are cross-checked per record via `_mget`; only records genuinely absent from the sink are excluded from the expectation. Any document beyond the source universe counts as a duplicate. | **`PASS`** | `G2 no duplicates ................ PASS (500,000 source / 500,000 sink / 0 dupes)` |
-| **G3** | **Sink Outage** | Stops the Elasticsearch container (`OUTAGE_DURATION_SEC`, default 5s; effective blackout includes the ES reboot, 11s measured) while mutating 200 source rows. Requires proof the breaker tripped (`totalTrips` advanced), then verifies every mutation lands by `_mget` version comparison and that the breaker returns to `CLOSED`. Downtime and recovery time are measured. | **`PASS`** | `G3 sink outage .................. PASS (11s down, 0 lost, recovered in 45.2s)` |
+| **G2** | **No Duplicates** | After the Gate 1 crash and replay, asserts **both receivers**: exact parity between the source table and the Elasticsearch index (poison pills in the DLQ are cross-checked per record via `_mget`; only records genuinely absent from the sink are excluded), and the independent consumer's unique-processed count ≥ replicated records (unreachable or lagging consumer = FAIL). Any document beyond the source universe counts as a duplicate. | **`PASS`** | `G2 no duplicates ................ PASS (501,000 source / 500,994 sink / 0 dupes)` |
+| **G3** | **Sink Outage** | Stops the Elasticsearch container (`OUTAGE_DURATION_SEC`, default 5s; effective blackout includes the ES reboot, 10–11s measured) while mutating 200 source rows. Requires proof the breaker tripped (observed `OPEN`, or `totalTrips` advanced), then verifies every mutation lands by `_mget` version comparison and that the breaker returns to `CLOSED`. Downtime and recovery time are measured. | **`PASS`** | `G3 sink outage .................. PASS (10s down, 0 lost, recovered in 42.2s)` |
 | **G4** | **Partial Batch Failure** | Injects 3 poisoned records into a batch of 500 on top of the existing index. Asserts that exactly 497 new documents appear in Elasticsearch (index delta) and exactly 3 rows land in `dead_letter_queue` with diagnostic context, without total batch rollback. | **`PASS`** | `G4 partial batch failure ........ PASS (497 written, 3 in DLQ)` |
 | **G5** | **Observability** | Asserts that operational state is fully introspectable via `/api/telemetry` without reading code or logs: answers backfill progress, current throughput, incremental lag, DLQ depth, and component health. | **`PASS`** | `G5 observability ................ PASS` |
 
 ### Authoritative Verification Suite Report
-Verbatim output of `make verify` on the current `main`, run in GitHub Codespaces (Linux, Docker-in-Docker, 6-container topology) against a fresh 500,000-row seed on 2026-09-18. Per-gate progress lines are abbreviated (`…`); the result lines are untouched.
+Verbatim output of `make verify` on the current `main`, run in GitHub Codespaces (Linux, Docker-in-Docker, 6-container topology) on 2026-09-18, after the Case Study 6 and 7 fixes were deployed. The dataset is the 500,000-row seed plus 1,000 rows injected by earlier Gate 4 runs; the 6 quarantined records are the poison pills from two of those runs, never replayed.
 
 ```text
 ======================================================================
           KILL IT TWICE: RESILIENCE VERIFICATION SUITE               
 ======================================================================
-[GATE 1] Dataset: 500,000 rows, max_id 500,000. Recovery window: 495,000 -> 500,000.
-[GATE 1] Backfill at 10,500 < window start 495,000; pre-rolling backfill to the window...
-[GATE 1] Pre-roll 18,000 / 495,000 (3.6%) @ ~1,362 rows/s
-…
-[GATE 1] Pre-roll 480,500 / 495,000 (97.1%) @ ~3,443 rows/s
-[GATE 1] Pre-roll reached 496,500 (window start 495,000).
-[GATE 1] Checkpoint pinned to window start 495,000 (status RUNNING).
-[GATE 1] In-flight at 496,500 (>= 496,500). Injecting SIGKILL...
-[GATE 1] Committed watermark after kill: 497,000. Restarting daemon...
-G1 resume after kill ............ PASS (killed at 497,331 / resumed at 497,000, 0 lost)
-[GATE 2] Source 500,000 rows; 0 quarantined for the ES sink -> expecting 500,000 documents.
-[GATE 2][WARN] Consumer at 0 unique < 500,000 indexed after 15s.
-G2 no duplicates ................ PASS (500,000 source / 500,000 sink / 0 dupes)
-[GATE 3] Baseline: 500,000 source rows, 500,000 indexed, expecting 500,000; ES breaker CLOSED (0 trips).
+[GATE 1] Dataset: 501,000 rows, max_id 501,000. Recovery window: 496,000 -> 501,000.
+[GATE 1] Checkpoint pinned to window start 496,000 (status RUNNING).
+[GATE 1] In-flight at 497,500 (>= 497,500). Injecting SIGKILL...
+[GATE 1] Committed watermark after kill: 497,500. Restarting daemon...
+G1 resume after kill ............ PASS (killed at 497,831 / resumed at 497,500, 0 lost)
+[GATE 2] Source 501,000 rows; 6 quarantined for the ES sink -> expecting 500,994 documents.
+G2 no duplicates ................ PASS (501,000 source / 500,994 sink / 0 dupes)
+[GATE 3] Baseline: 501,000 source rows, 500,994 indexed, expecting 500,994; ES breaker CLOSED (0 trips).
 [GATE 3] Elasticsearch outage injected via docker for 5s.
 [GATE 3] Mutated 200 source rows during the blackout.
-[GATE 3] Breaker trip not yet observable during the blackout (telemetry health probes block while the sink is down); will confirm via trip counter after restoration.
-[GATE 3] Circuit breaker trip confirmed after restoration: state=OPEN, trips 0 -> 1.
-[GATE 3] Recovering: breaker=OPEN, indexed=n/a/500,000, mutations landed=0/200
-…
+[GATE 3] Circuit breaker OPEN during blackout (backoff 4,374ms, trips 1).
+[GATE 3] Recovering: breaker=OPEN, indexed=n/a/500,994, mutations landed=0/200
+[GATE 3] Recovering: breaker=OPEN, indexed=n/a/500,994, mutations landed=0/200
+[GATE 3] Recovering: breaker=OPEN, indexed=n/a/500,994, mutations landed=0/200
+[GATE 3] Recovering: breaker=OPEN, indexed=n/a/500,994, mutations landed=0/200
+[GATE 3] Recovering: breaker=OPEN, indexed=n/a/500,994, mutations landed=0/200
+[GATE 3] Recovering: breaker=OPEN, indexed=n/a/500,994, mutations landed=0/200
+[GATE 3] Recovering: breaker=OPEN, indexed=500,994/500,994, mutations landed=0/200
 [GATE 3] Breaker HALF_OPEN with all outage mutations landed; fired canary batch 1/5 (10 rows) to close it.
-[GATE 3] Recovering: breaker=HALF_OPEN, indexed=500,000/500,000, mutations landed=200/200
-G3 sink outage .................. PASS (11s down, 0 lost, recovered in 45.2s)
-[GATE 4] Injected 500 records (497 valid, 3 poison) on top of 500,000 indexed documents.
+G3 sink outage .................. PASS (10s down, 0 lost, recovered in 42.2s)
+[GATE 4] Injected 500 records (497 valid, 3 poison) on top of 500,994 indexed documents.
 G4 partial batch failure ........ PASS (497 written, 3 in DLQ)
 G5 observability ................ PASS
 ======================================================================
@@ -133,10 +130,16 @@ ALL RESILIENCE GATES PASSED [5/5]
 ======================================================================
 ```
 
+Consumer state immediately before this run, after it drained the day's backlog (`GET :3001/metrics`):
+
+```json
+{ "totalReceived": 515107, "uniqueProcessed": 501414, "duplicatesPrevented": 13693, "deadLettered": 0, "dedupStoreSize": 500000 }
+```
+
 **Honest reading of this run**
-- **G3 recovery is 45.2s, not "seconds".** The breaker trips ~15s into the blackout (3 × 5s fail-fast timeouts), then Elasticsearch itself needs ~20s to reboot after `docker start`, then the breaker's jittered backoff (1s → 30s) must elapse before the next probe, then `HALF_OPEN` needs consecutive successes to close. Most of the 45s is the container reboot plus one backoff interval; none of it is lost data or busy-spin.
-- **`[GATE 2][WARN] Consumer at 0 unique`** is a real warning, not noise: the consumer's `/metrics` endpoint reported zero unique messages in this run. Gate 2 passes on Elasticsearch parity (its authoritative assertion) and logs the consumer figure as advisory. The consumer was in fact **not consuming** during this run — root cause and fix in Case Study 7; status in Section 11.
-- The two earlier same-day runs were **4/5** — Gate 3 failed twice for the reasons documented in Case Studies 5 and 6. Those failures were genuine and drove the fixes; they were not tuned away in the harness.
+- **G3 recovery is 42.2s, not "seconds".** The breaker trips ~15s into the blackout (3 × 5s fail-fast timeouts), then Elasticsearch itself needs ~20s to reboot after `docker start`, then the breaker's jittered backoff (1s → 30s) must elapse before the next probe, then `HALF_OPEN` needs consecutive successes to close. Most of the 42s is the container reboot plus one backoff interval; none of it is lost data or busy-spin. Note the trip was observed *live* this time (`OPEN during blackout`), because the fail-fast health probe (Case Study 6) no longer blocks telemetry while the sink is down.
+- **`duplicatesPrevented: 13,693` is the effectively-once contract with numbers on it.** Those are real redeliveries: batches the pipeline republished after Gate 1 `SIGKILL`s (the checkpoint commits only after both sinks ack, so a kill between the AMQP confirm and the checkpoint write replays the batch). At-least-once transport, deduplicated by `message_id` on the consumer, zero repeated side effects. `uniqueProcessed` exceeds the record count because every G3 mutation is a distinct versioned event (`rec_<id>_v2`); that is why the consumer assertion is `>=`, not `===`.
+- **Earlier same-day runs**: two were **4/5** (Gate 3 failed for the reasons in Case Studies 5 and 6), and the first 5/5 run still carried `[GATE 2][WARN] Consumer at 0 unique` — the consumer was not consuming at all (Case Study 7). At that point the harness treated the consumer count as advisory, so the gate passed on Elasticsearch parity alone. Once the consumer was fixed and shown at parity, the count was promoted to a hard assertion (unit tests 12–15 in `scripts/verify/__tests__/gate2.spec.js`). None of these failures was tuned away in the harness; each drove a code fix.
 
 ---
 
@@ -333,6 +336,8 @@ To maintain uncompromising fault tolerance, prevent feature creep, and adhere to
    - *Why Omitted*: WebSockets establish stateful TCP sockets that inevitably disconnect, drop packets, or hang during container chaos restarts and network blips. High-frequency 1.5s stateless HTTP polling against `/api/telemetry` provides resilient, self-healing telemetry that reconnects instantly without operator intervention.
 4. **Heavy Frontend Aesthetic Bloat & Heavy CSS Frameworks**:
    - *Why Omitted*: Avoided oversized component libraries and animation bloat. Built a high-density, utilitarian Datadog/Grafana-style operational console with sub-second paint times, instant panel toggles, and zero external CDN dependencies.
+5. **Persistent Consumer Deduplication Store (Redis / Postgres-backed)**:
+   - *Why Omitted*: The consumer's dedup window is an in-memory FIFO bounded to 500,000 keys, and its counters are process-lifetime. That is enough to prove the effectively-once contract under the gates (13,693 real redeliveries suppressed in the 2026-09-18 run) and keeps the consumer a zero-dependency worker. The trade-off is explicit: a consumer restart forgets the window, so a redelivery that straddles the restart would re-execute once, and Gate 2's counter would read low until the backlog is re-consumed. Persisting the window in Redis or a Postgres table would close both gaps but adds a stateful dependency to the one component whose job is to be trivially replaceable; for this scope, downstream idempotency at the business layer is the documented expectation.
 
 ---
 
@@ -385,7 +390,7 @@ In accordance with Section 6 of **`AGENTS.md`**, every architectural deviation, 
 - **Task Given**: Build an independent RabbitMQ consumer (`apps/consumer`) that dedups on `message_id` and reports its counts on `/metrics`, so Gate 2 can compare consumer parity with the source.
 - **Specification Assumption**: `SPEC.md §2.2` had the pipeline own the AMQP topology (`ensureRabbitMQTopology`) and the consumer simply subscribe to `replication.events.queue`. `index.ts` wrapped `consumer.start()` in a `try/catch` that logged "will be ready once RabbitMQ is reachable", on the assumption that the only startup failure mode was the broker not being up yet, and that Compose ordering would handle it.
 - **Why It Failed**: Every Codespaces run — including the 5/5 run above — logged `[GATE 2][WARN] Consumer at 0 unique < 500,000 indexed`. The endpoint was reachable, so the consumer process was alive, yet it had processed nothing. In `docker-compose.yml` the consumer depends only on `rabbitmq: service_healthy`, while the pipeline also waits on Elasticsearch, so the consumer reliably boots *first*. `ch.consume()` on a queue nobody has declared yet makes the broker close the channel with `404 NOT_FOUND`; `start()` threw; the catch block logged one line **and never retried**. The HTTP server kept serving zeros indefinitely. The same gap meant a broker restart — the brief's "the broker restarts" scenario — would silently end consumption forever, because the `close` handler cleared state and nothing reconnected. This violated AGENTS.md prohibition 2 (silent error swallowing) and left the "at least one independent consumer" acceptance criterion true only on paper.
-- **Remediation & Architecture Fix**: [`EventConsumerService`](apps/consumer/src/consumer.service.ts) now (1) declares the exchange, queue (with the identical `x-dead-letter-exchange` argument the pipeline uses — a mismatch is rejected by the broker as `PRECONDITION_FAILED`, loudly) and binding **idempotently before consuming**, so boot order relative to the pipeline is irrelevant; and (2) exposes `runSupervised()`, a reconnect loop with bounded exponential backoff and full jitter (1s → 30s) that retries startup failures and re-establishes consumption after a dropped connection. `stop()` cancels any pending reconnect. The connector is injectable, so unit tests 6–8 prove queue declaration, retry-until-success, and reconnect-after-close against a fake broker without RabbitMQ.
+- **Remediation & Architecture Fix**: [`EventConsumerService`](apps/consumer/src/consumer.service.ts) now (1) declares the exchange, queue (with the identical `x-dead-letter-exchange` argument the pipeline uses — a mismatch is rejected by the broker as `PRECONDITION_FAILED`, loudly) and binding **idempotently before consuming**, so boot order relative to the pipeline is irrelevant; and (2) exposes `runSupervised()`, a reconnect loop with bounded exponential backoff and full jitter (1s → 30s) that retries startup failures and re-establishes consumption after a dropped connection. `stop()` cancels any pending reconnect. The connector is injectable, so unit tests 6–8 prove queue declaration, retry-until-success, and reconnect-after-close against a fake broker without RabbitMQ. Confirmed in Codespaces the same day: the rebuilt consumer logged `Listening on queue 'replication.events.queue'` on first boot, drained 515,107 queued messages (501,414 unique, 13,693 redeliveries deduplicated), and the next `make verify` passed 5/5 with no consumer warning — at which point Gate 2's consumer count was promoted from advisory to a hard assertion.
 
 ---
 
@@ -425,7 +430,7 @@ Run the entire verification suite locally or in CI:
 # 1. Typecheck all workspaces (zero errors, strict mode)
 npm run typecheck
 
-# 2. Run all unit & integration test suites (120 tests: 54 pipeline, 8 consumer, 58 verification harness)
+# 2. Run all unit & integration test suites (124 tests: 54 pipeline, 8 consumer, 62 verification harness)
 npm test
 
 # 3. Execute the 5-Gate Resilience Harness
@@ -435,7 +440,8 @@ npm run verify
 ```
 
 ### Known Open Items
-- **Consumer parity is still advisory in Gate 2.** Every Codespaces run up to and including the 5/5 run above logged `[WARN] Consumer at 0 unique < N indexed`. The cause was found and fixed after that run (Case Study 7: the consumer booted before the pipeline declared the queue, failed once with `404 NOT_FOUND`, and never retried). The fix is covered by unit tests 6–8 in `apps/consumer` but has **not yet been confirmed by a full `make verify` run**; until it is, the harness keeps the consumer count as a warning rather than a hard assertion, and the acceptance criterion "at least one independent consumer" is evidenced by the consumer's tests and by RabbitMQ queue depth rather than by that harness line. Once a run shows the consumer at parity, the warning should be promoted to a Gate 2 failure condition.
+- None blocking. The consumer parity item (Case Study 7) was closed on 2026-09-18: after the fix, the consumer drained a 515,107-message backlog, reported 501,414 unique / 13,693 deduplicated, and the subsequent `make verify` passed 5/5 with no consumer warning. Gate 2 now fails if the consumer is unreachable or below parity.
+- Nice-to-have: the consumer's counters are process-lifetime and reset on restart. A consumer restart mid-run would make Gate 2 report a false parity failure until the backlog is re-consumed (dedup would suppress the side effects, but the counter would start from zero). Persisting the dedup window (Redis/Postgres) would fix both the counter and the 500,000-key bound at once; deliberately not built, see Section 8.
 
 ---
 
