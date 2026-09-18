@@ -61,11 +61,13 @@ export async function bootstrap(): Promise<BootstrapResult> {
   const port = parseInt(process.env.PIPELINE_PORT || process.env.PORT || '3000', 10);
   const batchSize = parseInt(process.env.BATCH_SIZE || '500', 10);
   const pollIntervalMs = parseInt(process.env.POLL_INTERVAL_MS || '1000', 10);
+  const esTimeoutMs = parseInt(process.env.ES_REQUEST_TIMEOUT_MS || '5000', 10);
 
   const pgPool = new pg.Pool({ connectionString: databaseUrl });
-  const esClient = new ESClient({ node: elasticsearchUrl });
+  // Deterministic per-request deadline, no client-side retries: the circuit breaker owns retry policy.
+  const esClient = new ESClient({ node: elasticsearchUrl, requestTimeout: esTimeoutMs, maxRetries: 0 });
 
-  const esSink = new ElasticsearchSink(esClient, { indexName: 'records_search_index' });
+  const esSink = new ElasticsearchSink(esClient, { indexName: 'records_search_index', timeoutMs: esTimeoutMs });
   const rmqSink = new RabbitMQSink({ connectionString: rabbitmqUrl });
 
   const esCircuitBreaker = new CircuitBreaker({

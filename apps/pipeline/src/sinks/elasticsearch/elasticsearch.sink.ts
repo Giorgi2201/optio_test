@@ -50,9 +50,10 @@ export class ElasticsearchSink {
   public async healthCheck(): Promise<ElasticsearchHealthResult> {
     const start = Date.now();
     try {
+      // Fail-fast probe: a health check must never wait out an outage behind client retries.
       const res = await this.client.cluster.health(
         {},
-        { requestTimeout: this.timeoutMs }
+        { requestTimeout: this.timeoutMs, maxRetries: 0 }
       );
       const latencyMs = Date.now() - start;
       const healthy = res.status !== 'red';
@@ -141,10 +142,16 @@ export class ElasticsearchSink {
       });
     }
 
-    const response = await this.client.bulk({
-      operations,
-      refresh: false
-    });
+    // Fail-fast contract (AGENTS.md §3.3): bound every request deterministically and disable the
+    // client's internal retries. Retry/backoff policy belongs to the circuit breaker wrapping this
+    // call; otherwise a request can silently wait out a sink outage and the breaker never observes it.
+    const response = await this.client.bulk(
+      {
+        operations,
+        refresh: false
+      },
+      { requestTimeout: this.timeoutMs, maxRetries: 0 }
+    );
 
     return this.parseBulkResponse(records, response);
   }
