@@ -83,9 +83,26 @@ describe('Gate 3 Verification - Receiver Outage, Anti-Busy-Loop & Self-Healing',
    * Fake receiver + pipeline for orchestration tests. Time is virtual: sleep() advances the clock,
    * so measured downtime / recovery are deterministic.
    */
-  function createOutageFixture({ breakerOpens = true, dropOne = false } = {}) {
-    const state = { receiverDown: false, mutated: [] };
+  function createOutageFixture({
+    breakerOpens = true,
+    dropOne = false,
+    telemetryDarkDuringOutage = false,
+    halfOpenUntilCanary = false
+  } = {}) {
+    // versions[id] = version currently indexed in the fake Elasticsearch
+    const state = { receiverDown: false, mutated: [], mutateCalls: 0, indexed: new Map(), sourceVersion: new Map() };
     let fakeNow = 5_000_000;
+    let trips = 0;
+
+    const currentSourceVersion = (id) => state.sourceVersion.get(id) ?? 1;
+
+    const breakerState = () => {
+      if (!breakerOpens) return 'CLOSED';
+      if (state.receiverDown) return 'OPEN';
+      // After restoration: HALF_OPEN until a canary write has happened (second success), then CLOSED
+      if (halfOpenUntilCanary && state.mutateCalls < 2) return 'HALF_OPEN';
+      return 'CLOSED';
+    };
 
     return {
       state,
@@ -97,6 +114,7 @@ describe('Gate 3 Verification - Receiver Outage, Anti-Busy-Loop & Self-Healing',
       refreshElasticsearch: async () => !state.receiverDown,
       stopReceiver: async () => {
         state.receiverDown = true;
+        if (breakerOpens) trips++;
         return { mode: 'mock', action: 'stopped' };
       },
       startReceiver: async () => {
@@ -104,28 +122,41 @@ describe('Gate 3 Verification - Receiver Outage, Anti-Busy-Loop & Self-Healing',
         return { mode: 'mock', action: 'started' };
       },
       mutateSourceRecords: async (count) => {
-        state.mutated = Array.from({ length: count }, (_, i) => ({ id: 5000 - i, version: 2 }));
-        return state.mutated;
+        state.mutateCalls++;
+        const rows = Array.from({ length: count }, (_, i) => {
+          const id = 5000 - i;
+          const version = currentSourceVersion(id) + 1;
+          state.sourceVersion.set(id, version);
+          return { id, version };
+        });
+        if (state.mutateCalls === 1) state.mutated = rows;
+        return rows;
       },
-      getTelemetry: async () => ({
-        status: 'RUNNING',
-        backfill_status: 'COMPLETED',
-        incremental_lag_records: state.receiverDown ? state.mutated.length : 0,
-        circuit_breakers: {
-          elasticsearch:
-            state.receiverDown && breakerOpens
-              ? { state: 'OPEN', isThrottling: true, currentBackoffMs: 2000, totalTrips: 1 }
-              : { state: 'CLOSED', isThrottling: false, currentBackoffMs: 0, totalTrips: breakerOpens ? 1 : 0 }
-        }
-      }),
+      getTelemetry: async () => {
+        if (telemetryDarkDuringOutage && state.receiverDown) return null;
+        return {
+          status: 'RUNNING',
+          backfill_status: 'COMPLETED',
+          incremental_lag_records: state.receiverDown ? state.mutated.length : 0,
+          circuit_breakers: {
+            elasticsearch: {
+              state: breakerState(),
+              isThrottling: breakerState() !== 'CLOSED',
+              currentBackoffMs: breakerState() === 'OPEN' ? 2000 : 0,
+              totalTrips: trips
+            }
+          }
+        };
+      },
       getElasticsearchCount: async () => (state.receiverDown ? null : 5000),
       getElasticsearchDocs: async (ids) => {
         if (state.receiverDown) return null;
         return ids.map((id, i) => ({
           id: String(id),
           found: true,
-          // Optionally leave one mutation permanently unreplicated to simulate loss
-          source: { id: String(id), version: dropOne && i === 0 ? 1 : 2 }
+          // Replication catches up to the source version once the receiver is back,
+          // except optionally one record left permanently stale to simulate loss.
+          source: { id: String(id), version: dropOne && i === 0 ? 1 : currentSourceVersion(Number(id)) }
         }));
       }
     };
@@ -193,5 +224,74 @@ describe('Gate 3 Verification - Receiver Outage, Anti-Busy-Loop & Self-Healing',
     assert.match(result.output, /1 records lost during outage/);
     // Receiver is always restored, even on failure
     assert.equal(fixture.state.receiverDown, false);
+  });
+
+  it('10. Telemetry dark during the blackout: the breaker trip is still confirmed via its trip counter after restoration', async () => {
+    const fixture = createOutageFixture({ telemetryDarkDuringOutage: true });
+
+    const result = await runGate3({
+      ...fixture,
+      outageDurationMs: 5000,
+      maxRecoveryWaitMs: 10000,
+      quiesceTimeoutMs: 1000,
+      silent: true,
+      closeDb: false
+    });
+
+    assert.equal(result.passed, true);
+    assert.equal(result.antiBusyLoopVerified, true);
+    assert.deepEqual(result.breakerTrips, { before: 0, after: 1 });
+    assert.equal(result.lostRecords, 0);
+  });
+
+  it('11. HALF_OPEN starvation: once outage traffic has landed, canary writes let the breaker close instead of timing out', async () => {
+    const fixture = createOutageFixture({ halfOpenUntilCanary: true });
+
+    const result = await runGate3({
+      ...fixture,
+      outageDurationMs: 5000,
+      mutationCount: 200,
+      canarySize: 10,
+      canaryIntervalMs: 0,
+      maxRecoveryWaitMs: 10000,
+      quiesceTimeoutMs: 1000,
+      silent: true,
+      closeDb: false
+    });
+
+    assert.equal(result.passed, true);
+    assert.equal(result.canariesFired, 1);
+    assert.equal(fixture.state.mutateCalls, 2);
+    // Canary rows are verified too (they overlap the top-200 ids, so the set stays at 200)
+    assert.equal(result.verifiedRecords, 200);
+    assert.equal(result.lostRecords, 0);
+    assert.match(result.output, /PASS/);
+  });
+
+  it('12. Canary budget is bounded: a breaker that never closes fails honestly after the recovery window', async () => {
+    const fixture = createOutageFixture({ halfOpenUntilCanary: true });
+    // Breaker stays HALF_OPEN no matter how many canaries land
+    fixture.state.mutateCalls = -Infinity;
+    const stuckMutate = fixture.mutateSourceRecords;
+    fixture.mutateSourceRecords = async (count) => {
+      const rows = await stuckMutate(count);
+      fixture.state.mutateCalls = -Infinity;
+      return rows;
+    };
+
+    const result = await runGate3({
+      ...fixture,
+      outageDurationMs: 5000,
+      canaryIntervalMs: 0,
+      maxCanaries: 3,
+      maxRecoveryWaitMs: 5000,
+      quiesceTimeoutMs: 1000,
+      silent: true,
+      closeDb: false
+    });
+
+    assert.equal(result.passed, false);
+    assert.equal(result.canariesFired, 3);
+    assert.match(result.output, /recovery timed out or failed/);
   });
 });

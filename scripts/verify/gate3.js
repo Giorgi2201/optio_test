@@ -34,6 +34,14 @@ const DEFAULT_MAX_RECOVERY_WAIT_MS = 120000;
 const DEFAULT_PROBE_TIMEOUT_MS = 15000;
 const DEFAULT_QUIESCE_TIMEOUT_MS = 30000;
 const BREAKER_GRACE_MS = 5000;
+// /api/telemetry runs live sink health probes; while a sink is down those probes can block for
+// several seconds, so Gate 3 polls telemetry with a longer deadline than the other gates.
+const DEFAULT_TELEMETRY_TIMEOUT_MS = 8000;
+// HALF_OPEN -> CLOSED requires consecutive successful writes. On an idle pipeline the breaker would
+// starve in HALF_OPEN forever, so once the outage traffic has landed we feed it small canary batches.
+const DEFAULT_CANARY_SIZE = 10;
+const DEFAULT_CANARY_INTERVAL_MS = 3000;
+const DEFAULT_MAX_CANARIES = 5;
 
 function fmt(n) {
   return Number(n).toLocaleString('en-US');
@@ -68,12 +76,16 @@ async function runGate3(options = {}) {
   const maxRecoveryWaitMs = options.maxRecoveryWaitMs || DEFAULT_MAX_RECOVERY_WAIT_MS;
   const probeTimeoutMs = options.probeTimeoutMs !== undefined ? options.probeTimeoutMs : DEFAULT_PROBE_TIMEOUT_MS;
   const quiesceTimeoutMs = options.quiesceTimeoutMs !== undefined ? options.quiesceTimeoutMs : DEFAULT_QUIESCE_TIMEOUT_MS;
+  const telemetryTimeoutMs = options.telemetryTimeoutMs || DEFAULT_TELEMETRY_TIMEOUT_MS;
+  const canarySize = options.canarySize || DEFAULT_CANARY_SIZE;
+  const canaryIntervalMs = options.canaryIntervalMs !== undefined ? options.canaryIntervalMs : DEFAULT_CANARY_INTERVAL_MS;
+  const maxCanaries = options.maxCanaries !== undefined ? options.maxCanaries : DEFAULT_MAX_CANARIES;
   const log = options.silent ? () => {} : (msg) => console.log(`[GATE 3] ${msg}`);
   const warn = options.silent ? () => {} : (msg) => console.warn(`[GATE 3][WARN] ${msg}`);
 
   const pollTelemetry = async () => {
     try {
-      return await telemetryFn();
+      return await telemetryFn(undefined, telemetryTimeoutMs);
     } catch {
       return null;
     }
@@ -151,7 +163,19 @@ async function runGate3(options = {}) {
 
     await safeRefresh();
     const baselineEsCount = await safeEsCount();
-    log(`Baseline: ${fmt(sourceCount)} source rows, ${baselineEsCount === null ? 'n/a' : fmt(baselineEsCount)} indexed, expecting ${fmt(expectedSinkCount)}.`);
+    const baselineBreaker = (quiesce.telemetry || telemetry)?.circuit_breakers?.elasticsearch;
+    const baselineTrips = typeof baselineBreaker?.totalTrips === 'number' ? baselineBreaker.totalTrips : 0;
+    log(`Baseline: ${fmt(sourceCount)} source rows, ${baselineEsCount === null ? 'n/a' : fmt(baselineEsCount)} indexed, expecting ${fmt(expectedSinkCount)}; ES breaker ${baselineBreaker?.state ?? 'n/a'} (${fmt(baselineTrips)} trips).`);
+
+    // Evidence that the breaker tripped: seen OPEN / HALF_OPEN / throttling, or its trip counter advanced.
+    const breakerTripped = (b) =>
+      Boolean(
+        b &&
+          (b.state === 'OPEN' ||
+            b.state === 'HALF_OPEN' ||
+            b.isThrottling === true ||
+            (typeof b.totalTrips === 'number' && b.totalTrips > baselineTrips))
+      );
 
     // -------------------------------------------------------------------------
     // Step 2: Outage injection, then traffic that must survive it
@@ -179,16 +203,16 @@ async function runGate3(options = {}) {
       await sleepFn(250);
       telemetry = await pollTelemetry();
       const esBreaker = telemetry?.circuit_breakers?.elasticsearch;
-      if (esBreaker && (esBreaker.state === 'OPEN' || esBreaker.isThrottling)) {
+      if (breakerTripped(esBreaker)) {
         antiBusyLoopVerified = true;
         breakerSnapshot = esBreaker;
         break;
       }
     }
     if (antiBusyLoopVerified) {
-      log(`Circuit breaker ${breakerSnapshot.state} (backoff ${fmt(breakerSnapshot.currentBackoffMs ?? 0)}ms, trips ${fmt(breakerSnapshot.totalTrips ?? 0)}).`);
+      log(`Circuit breaker ${breakerSnapshot.state} during blackout (backoff ${fmt(breakerSnapshot.currentBackoffMs ?? 0)}ms, trips ${fmt(breakerSnapshot.totalTrips ?? 0)}).`);
     } else {
-      warn('Circuit breaker was never observed OPEN / throttling during the blackout.');
+      log('Breaker trip not yet observable during the blackout (telemetry health probes block while the sink is down); will confirm via trip counter after restoration.');
     }
 
     // -------------------------------------------------------------------------
@@ -207,12 +231,14 @@ async function runGate3(options = {}) {
     // -------------------------------------------------------------------------
     // Step 5: Self-healing & per-record recovery measurement
     // -------------------------------------------------------------------------
-    const ids = mutated.map((m) => String(m.id));
     let recovered = false;
     let recoveredAt = null;
     let matched = 0;
     let finalEsCount = null;
     let lastLog = restoredAt;
+    let canariesFired = 0;
+    let lastCanaryAt = null;
+    let lastBreaker = null;
 
     while (nowFn() - restoredAt < maxRecoveryWaitMs) {
       await sleepFn(500);
@@ -220,6 +246,7 @@ async function runGate3(options = {}) {
 
       telemetry = await pollTelemetry();
       const count = await safeEsCount();
+      const ids = [...expectedVersions.keys()];
       const docs = await safeEsDocs(ids);
 
       if (count !== null) {
@@ -230,9 +257,17 @@ async function runGate3(options = {}) {
       }
 
       const esBreaker = telemetry?.circuit_breakers?.elasticsearch;
+      if (esBreaker) {
+        lastBreaker = esBreaker;
+        if (!antiBusyLoopVerified && breakerTripped(esBreaker)) {
+          antiBusyLoopVerified = true;
+          log(`Circuit breaker trip confirmed after restoration: state=${esBreaker.state}, trips ${fmt(baselineTrips)} -> ${fmt(esBreaker.totalTrips ?? 0)}.`);
+        }
+      }
+
       const breakerClosed = esBreaker ? esBreaker.state === 'CLOSED' : true;
       const countParity = count !== null && count >= expectedSinkCount;
-      const versionsLanded = matched === mutated.length;
+      const versionsLanded = matched === expectedVersions.size;
 
       if (breakerClosed && countParity && versionsLanded) {
         recovered = true;
@@ -240,17 +275,38 @@ async function runGate3(options = {}) {
         break;
       }
 
+      // Outage traffic has landed but the breaker is still probing (HALF_OPEN): give it canary
+      // writes so it can accumulate its consecutive successes and close — an idle pipeline cannot.
+      if (
+        versionsLanded &&
+        esBreaker &&
+        esBreaker.state !== 'CLOSED' &&
+        canariesFired < maxCanaries &&
+        (lastCanaryAt === null || nowFn() - lastCanaryAt >= canaryIntervalMs)
+      ) {
+        const canary = await mutateFn(canarySize);
+        for (const c of canary || []) {
+          expectedVersions.set(String(c.id), c.version);
+        }
+        canariesFired++;
+        lastCanaryAt = nowFn();
+        log(`Breaker ${esBreaker.state} with all outage mutations landed; fired canary batch ${canariesFired}/${maxCanaries} (${(canary || []).length} rows) to close it.`);
+      }
+
       if (nowFn() - lastLog >= 5000) {
         lastLog = nowFn();
-        log(`Recovering: breaker=${esBreaker?.state ?? 'n/a'}, indexed=${count === null ? 'n/a' : fmt(count)}/${fmt(expectedSinkCount)}, mutations landed=${matched}/${mutated.length}`);
+        log(`Recovering: breaker=${esBreaker?.state ?? 'n/a'}, indexed=${count === null ? 'n/a' : fmt(count)}/${fmt(expectedSinkCount)}, mutations landed=${matched}/${expectedVersions.size}`);
       }
     }
 
-    const lostRecords = mutated.length - matched;
+    const lostRecords = expectedVersions.size - matched;
     const recoveryTimeSec = recovered ? Number(((recoveredAt - restoredAt) / 1000).toFixed(1)) : -1;
 
     if (!recovered) {
-      warn(`Self-healing did not complete within ${maxRecoveryWaitMs / 1000}s: indexed ${finalEsCount === null ? 'n/a' : fmt(finalEsCount)}/${fmt(expectedSinkCount)}, mutations landed ${matched}/${mutated.length}.`);
+      warn(`Self-healing did not complete within ${maxRecoveryWaitMs / 1000}s: breaker ${lastBreaker?.state ?? 'n/a'}, indexed ${finalEsCount === null ? 'n/a' : fmt(finalEsCount)}/${fmt(expectedSinkCount)}, mutations landed ${matched}/${expectedVersions.size}.`);
+    }
+    if (!antiBusyLoopVerified) {
+      warn(`Circuit breaker never showed a trip: state ${lastBreaker?.state ?? 'n/a'}, trips ${fmt(lastBreaker?.totalTrips ?? baselineTrips)} (baseline ${fmt(baselineTrips)}).`);
     }
 
     // -------------------------------------------------------------------------
@@ -258,6 +314,9 @@ async function runGate3(options = {}) {
     // -------------------------------------------------------------------------
     const result = evaluateGate3Outage(downtimeSec, lostRecords, recoveryTimeSec, antiBusyLoopVerified);
     result.mutatedCount = mutated.length;
+    result.canariesFired = canariesFired;
+    result.verifiedRecords = expectedVersions.size;
+    result.breakerTrips = { before: baselineTrips, after: lastBreaker?.totalTrips ?? null };
     result.finalEsCount = finalEsCount;
     result.expectedSinkCount = expectedSinkCount;
     result.outageMode = stopInfo?.mode || 'unknown';
